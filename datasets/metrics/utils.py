@@ -456,6 +456,29 @@ def compute_relation_recall(
     return relation_curves
 
 
+def compute_f1(precision, recall):
+    """
+    Compute F1 score from precision and recall.
+    
+    Inputs:
+      - precision: float, 1D array, or 2D array
+      - recall: float, 1D array, or 2D array (must match precision shape)
+    Returns:
+      - F1 score with same shape as inputs
+    """
+    precision = np.asarray(precision, dtype=np.float64)
+    recall = np.asarray(recall, dtype=np.float64)
+    
+    denom = precision + recall
+    f1 = np.divide(
+        2 * precision * recall,
+        denom,
+        out=np.zeros_like(denom),
+        where=denom > 0
+    )
+    return f1
+
+
 def compute_precision_recall_relation(
     gt_coords_list,
     gt_labels_list,
@@ -491,9 +514,13 @@ def compute_precision_recall_relation(
     relations = set(prec.keys()) | set(rec.keys())
     merged = {}
     for r in relations:
+        precision = prec.get(r, {}).get('precision', [])
+        recall = rec.get(r, {}).get('recall', [])
+        f1 = compute_f1(precision, recall).tolist() if precision and recall else []
         merged[r] = {
-            'precision': prec.get(r, {}).get('precision', []),
-            'recall': rec.get(r, {}).get('recall', []),
+            'precision': precision,
+            'recall': recall,
+            'f1': f1,
             'thresholds': prec.get(r, {}).get('thresholds', rec.get(r, {}).get('thresholds', []))
         }
     return merged
