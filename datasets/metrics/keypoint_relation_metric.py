@@ -52,39 +52,63 @@ class KeypointRelationMetric(BaseMetric):
     def process(self, data_batch: dict, data_samples: Sequence[dict]) -> None:
         for data_sample in data_samples:
             pred = data_sample['pred_instances']
-
             img_w = int(data_sample['ori_shape'][1])
             img_h = int(data_sample['ori_shape'][0])
             max_dim = max(img_w, img_h)
-
+            
+            # Handle cropped images
+            crop_bbox = data_sample.get('crop_bbox', None)
+            gt_coords = data_sample['gt_instances']['keypoint_coords'].cpu().numpy().reshape(-1, 2)
+            gt_labels = np.array([data_sample['text'][label] for label in data_sample['gt_instances']['labels']])
+            gt_relations = data_sample['gt_instances']['relation_matrices'].cpu().numpy()
+            pred_coords = pred['keypoints'].cpu().numpy().reshape(-1, 2)
+            
+            if crop_bbox is not None:
+                # crop_bbox format: [x1, y1, x2, y2]
+                x1, y1, x2, y2 = crop_bbox
+                
+                # Filter GT keypoints: keep only those inside crop region
+                gt_mask = (
+                    (gt_coords[:, 0] >= x1) & (gt_coords[:, 0] < x2) &
+                    (gt_coords[:, 1] >= y1) & (gt_coords[:, 1] < y2)
+                )
+                gt_coords = gt_coords[gt_mask]
+                gt_labels = gt_labels[gt_mask]
+                
+                # Filter relation matrices
+                gt_relations = gt_relations[gt_mask][:, gt_mask, :]
+                
+                # Translate predicted keypoints to global coordinates
+                pred_coords[:, 0] += x1
+                pred_coords[:, 1] += y1
+            
             record = dict(
                 img_id=data_sample['img_id'],
                 img_path=data_sample['img_path'],
                 img_width=img_w,
                 img_height=img_h,
                 max_dim=max_dim,
-                gt_coords=data_sample['gt_instances']['keypoint_coords'].cpu().numpy().reshape(-1, 2),
-                gt_labels=np.array([data_sample['text'][label] for label in data_sample['gt_instances']['labels']]),
-                gt_relations=data_sample['gt_instances']['relation_matrices'].cpu().numpy(),
+                gt_coords=gt_coords,
+                gt_labels=gt_labels,
+                gt_relations=gt_relations,
                 relation_names=data_sample.get('relation_text', []),
-                pred_coords=pred['keypoints'].cpu().numpy().reshape(-1, 2),
+                pred_coords=pred_coords,
                 pred_labels=np.array(pred['label_names']),
                 pred_scores=pred['scores'].cpu().numpy(),
                 pred_relations=pred['relation_scores'].cpu().numpy(),
             )
             self.results.append(record)
-
+            
             if self.save_path_preds is not None:
                 os.makedirs(self.save_path_preds, exist_ok=True)
                 img_filename = os.path.splitext(os.path.basename(data_sample['img_path']))[0]
-
                 pred_dict = {
                     'img_id': record['img_id'],
                     'img_path': record['img_path'],
                     'keypoint_label_names': pred['label_names'],
                     'keypoint_labels': pred.get('labels', None) and pred['labels'].cpu().tolist(),
                     'keypoint_scores': record['pred_scores'].tolist(),
-                    'keypoint_coords': pred['keypoints'].cpu().tolist(),
+                    'keypoint_coords': pred_coords.tolist(),
                     'keypoint_relation_scores': record['pred_relations'].tolist() if record['pred_relations'] is not None else None,
                 }
                 gt_dict = {
@@ -97,7 +121,6 @@ class KeypointRelationMetric(BaseMetric):
                     'relation_matrices': record['gt_relations'].tolist() if record['gt_relations'] is not None else None,
                     'relation_names': record['relation_names'],
                 }
-
                 with open(os.path.join(self.save_path_preds, f"{img_filename}_pred.json"), "w") as f:
                     json.dump(pred_dict, f, indent=2)
                 with open(os.path.join(self.save_path_preds, f"{img_filename}_gt.json"), "w") as f:

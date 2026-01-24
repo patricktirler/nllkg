@@ -207,86 +207,105 @@ class TransformKeypoints(BaseTransform):
         return results
     
     
-
 @TRANSFORMS.register_module()
 class PackKeypointGraphInputs(PackDetInputs):
-
+    def __init__(self,
+                 meta_keys=('img_id', 'img_path', 'ori_shape', 'img_shape',
+                            'scale_factor', 'flip', 'flip_direction'),
+                 pack_only_inliers=True):
+        self.meta_keys = meta_keys
+        self.pack_only_inliers = pack_only_inliers
+    
     mapping_table = {
         'gt_bboxes': 'bboxes',
         'gt_keypoint_labels': 'labels',
         'gt_keypoint_ids': 'keypoint_ids',
         'gt_keypoint_coords': 'keypoint_coords',
     }
-
+    
     def transform(self, results: dict) -> dict:
         """
-        Pack inputs and ignore keypoints that lie outside the image.
+        Pack inputs and optionally ignore keypoints that lie outside the image.
+        
+        Args:
+            results: Dictionary containing image and keypoint data
+            
+        Returns:
+            packed_results: Packed data with optional filtering
         """
-        # ---- determine valid keypoints ----
+        if self.pack_only_inliers:
+            valid_mask = self._get_valid_mask(results)
+            if valid_mask is not None:
+                results = self._filter_results(results, valid_mask)
+        
+        # Call base packer
+        packed_results = super().transform(results)
+        
+        # Attach relation matrices
+        if 'gt_relation_matrices' in results:
+            packed_results['data_samples'] \
+                .gt_instances.relation_matrices = to_tensor(
+                    results['gt_relation_matrices']
+                )
+        
+        return packed_results
+    
+    def _get_valid_mask(self, results: dict) -> np.ndarray:
+        """Determine valid keypoints (inside image bounds and not ignored)."""
         img_h, img_w = results['img_shape']
-
         keypoints = results.get('gt_keypoint_coords', None)
+        
+        # Check if keypoints are inside image bounds
         if keypoints is not None:
             keypoints = np.asarray(keypoints)
-
             x = keypoints[:, 0, 0]
             y = keypoints[:, 0, 1]
-
             inside_mask = (
                 (x >= 0) & (x < img_w) &
                 (y >= 0) & (y < img_h)
             )
         else:
             inside_mask = None
-
-        # combine with gt_ignore_flags if present
+        
+        # Combine with gt_ignore_flags if present
         if 'gt_ignore_flags' in results:
             ignore_mask = results['gt_ignore_flags'] == 0
             valid_mask = ignore_mask if inside_mask is None \
                 else (ignore_mask & inside_mask)
         else:
             valid_mask = inside_mask
-
-        # ---- filter fields BEFORE packing ----
-        if valid_mask is not None:
-            valid_idx = np.where(valid_mask)[0]
-
-            for key in self.mapping_table.keys():
-                if key not in results:
-                    continue
-
-                results[key] = results[key][valid_idx]
-
-            # relation matrices: filter both axes
-            if 'gt_relation_matrices' in results:
-                rel = results['gt_relation_matrices']
-                rel = rel[valid_idx][:, valid_idx, :]
-                results['gt_relation_matrices'] = rel
-
-            # update ignore flags to reflect filtering
-            results['gt_ignore_flags'] = np.zeros(
-                len(valid_idx), dtype=np.int64
-            )
-
-        # ---- call base packer ----
-        packed_results = super().transform(results)
-
-        # ---- attach relation matrices ----
+        
+        return valid_mask
+    
+    def _filter_results(self, results: dict, valid_mask: np.ndarray) -> dict:
+        """Filter results based on valid_mask."""
+        valid_idx = np.where(valid_mask)[0]
+        
+        # Filter mapping table keys
+        for key in self.mapping_table.keys():
+            if key not in results:
+                continue
+            results[key] = results[key][valid_idx]
+        
+        # Filter relation matrices on both axes
         if 'gt_relation_matrices' in results:
-            packed_results['data_samples'] \
-                .gt_instances.relation_matrices = to_tensor(
-                    results['gt_relation_matrices']
-                )
-
-        return packed_results
-
+            rel = results['gt_relation_matrices']
+            rel = rel[valid_idx][:, valid_idx, :]
+            results['gt_relation_matrices'] = rel
+        
+        # Update ignore flags to reflect filtering
+        results['gt_ignore_flags'] = np.zeros(
+            len(valid_idx), dtype=np.int64
+        )
+        
+        return results
 
 
 @TRANSFORMS.register_module()
 class TopDownBBoxCrop(BaseTransform):
-    """Crop image tightly to bbox using perspective warp.
+    """Crop image tightly to crop_bbox using perspective warp.
 
-    - Computes 4 bbox corners
+    - Computes 4 crop_bbox corners
     - Applies existing homography
     - Crops via perspective warp (rotation preserved)
     - Updates gt_bboxes by warping their corners
@@ -299,9 +318,9 @@ class TopDownBBoxCrop(BaseTransform):
         self.transform_keypoints = transform_keypoints
 
     @staticmethod
-    def _bbox_to_corners(bbox):
+    def _bbox_to_corners(crop_bbox):
         """(x1,y1,x2,y2) -> (4,2) TL,TR,BR,BL"""
-        x1, y1, x2, y2 = bbox
+        x1, y1, x2, y2 = crop_bbox
         return np.array(
             [[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
             dtype=np.float32,
@@ -319,7 +338,7 @@ class TopDownBBoxCrop(BaseTransform):
 
     @staticmethod
     def _perspective_crop(img, corners):
-        """Perspective crop using warped bbox corners"""
+        """Perspective crop using warped crop_bbox corners"""
         w1 = np.linalg.norm(corners[1] - corners[0])
         w2 = np.linalg.norm(corners[2] - corners[3])
         h1 = np.linalg.norm(corners[3] - corners[0])
@@ -355,18 +374,18 @@ class TopDownBBoxCrop(BaseTransform):
         return np.asarray(warped_boxes, dtype=np.float32)
 
     def transform(self, results: dict) -> dict:
-        if 'bbox' not in results or 'img' not in results:
+        if 'crop_bbox' not in results or 'img' not in results:
             return results
 
         img = results['img']
-        bbox = np.asarray(results['bbox'], dtype=np.float32)
+        crop_bbox = np.asarray(results['crop_bbox'], dtype=np.float32)
 
         H_prev = results.get(
             'homography_matrix', np.eye(3, dtype=np.float32)
         )
 
-        # --- main bbox crop ---
-        corners = self._bbox_to_corners(bbox)
+        # --- main crop_bbox crop ---
+        corners = self._bbox_to_corners(crop_bbox)
         corners = self._apply_homography(corners, H_prev)
         crop, H_crop = self._perspective_crop(img, corners)
 
@@ -407,10 +426,6 @@ class TopDownBBoxCrop(BaseTransform):
         # --- finalize ---
         results['img'] = crop
         results['img_shape'] = (crop.shape[0], crop.shape[1])
-        results['bbox'] = np.array(
-            [0, 0, crop.shape[1], crop.shape[0]],
-            dtype=np.float32,
-        )
 
         return results
 

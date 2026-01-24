@@ -162,22 +162,19 @@ class KeypointGraphDataset(CocoDataset):
             img_width = parsed_data_info['width']
             
             for crop_h, crop_w in self.crop_sizes:
-                # If crop is larger than image, add single crop covering entire image
-                if crop_h > img_height or crop_w > img_width:
+                crop_h = min(crop_h, img_height)
+                crop_w = min(crop_w, img_width)
+
+                # Generate crop coordinates
+                crop_coords = generate_crop_coordinates(
+                    img_height, img_width, crop_h, crop_w, self.min_crop_overlap
+                )
+                
+                # Create a copy of data_info for each crop
+                for crop_bbox in crop_coords:
                     cropped_data = copy.deepcopy(parsed_data_info)
-                    cropped_data['bbox'] = (0, 0, img_width, img_height)
+                    cropped_data['crop_bbox'] = crop_bbox  # (x1, y1, x2, y2)
                     cropped_data_list.append(cropped_data)
-                else:
-                    # Generate crop coordinates
-                    crop_coords = generate_crop_coordinates(
-                        img_height, img_width, crop_h, crop_w, self.min_crop_overlap
-                    )
-                    
-                    # Create a copy of data_info for each crop
-                    for crop_bbox in crop_coords:
-                        cropped_data = copy.deepcopy(parsed_data_info)
-                        cropped_data['bbox'] = crop_bbox  # (x1, y1, x2, y2)
-                        cropped_data_list.append(cropped_data)
         
         return cropped_data_list
 
