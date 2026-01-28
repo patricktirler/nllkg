@@ -156,25 +156,57 @@ class KeypointGraphDataset(CocoDataset):
             return base_data_list
         
         # Apply cropping to each item in the base data list
-        cropped_data_list = []
+        cropped_data_by_size = {crop_size: [] for crop_size in self.crop_sizes}
+        
         for parsed_data_info in base_data_list:
             img_height = parsed_data_info['height']
             img_width = parsed_data_info['width']
+            instances = parsed_data_info.get('instances', [])
             
-            for crop_h, crop_w in self.crop_sizes:
-                crop_h = min(crop_h, img_height)
-                crop_w = min(crop_w, img_width)
+            for crop_h_org, crop_w_org in self.crop_sizes:
+                crop_h = min(crop_h_org, img_height)
+                crop_w = min(crop_w_org, img_width)
 
                 # Generate crop coordinates
                 crop_coords = generate_crop_coordinates(
                     img_height, img_width, crop_h, crop_w, self.min_crop_overlap
                 )
                 
-                # Create a copy of data_info for each crop
+                # Create a copy of data_info for each crop, but only if it contains keypoints
                 for crop_bbox in crop_coords:
-                    cropped_data = copy.deepcopy(parsed_data_info)
-                    cropped_data['crop_bbox'] = crop_bbox  # (x1, y1, x2, y2)
-                    cropped_data_list.append(cropped_data)
+                    x1, y1, x2, y2 = crop_bbox
+                    
+                    # Check if any keypoint is within this crop bbox
+                    has_keypoints = False
+                    for instance in instances:
+                        kp_x, kp_y = instance['keypoint_coords']
+                        if x1 <= kp_x < x2 and y1 <= kp_y < y2:
+                            has_keypoints = True
+                            break
+                    
+                    # Only add crop if it contains keypoints
+                    if has_keypoints:
+                        cropped_data = copy.deepcopy(parsed_data_info)
+                        cropped_data['crop_bbox'] = crop_bbox  # (x1, y1, x2, y2)
+                        cropped_data_by_size[(crop_h_org, crop_w_org)].append(cropped_data)
+        
+        # Balance the number of items across crop sizes by sampling
+        crop_size_counts = {crop_size: len(items) for crop_size, items in cropped_data_by_size.items()}
+        max_count = max(crop_size_counts.values()) if crop_size_counts else 0
+        
+        cropped_data_list = []
+        for crop_size in self.crop_sizes:
+            items = cropped_data_by_size[crop_size]
+            current_count = len(items)
+            
+            # Add all items
+            cropped_data_list.extend(items)
+            
+            # If this crop size has fewer items than max, sample with replacement to fill up
+            if current_count < max_count:
+                deficit = max_count - current_count
+                sampled_items = np.random.choice(items, size=deficit, replace=True)
+                cropped_data_list.extend(sampled_items)
         
         return cropped_data_list
 
