@@ -9,23 +9,26 @@ class InstanceGroup:
     keypoint_labels: (K,) labels corresponding to node_ids order.
     keypoint_scores: (K,) scores corresponding to node_ids order.
     adjacency_matrix: (K, K, R) relation scores subset for these nodes.
+    keypoint_coords: Optional (K, 2) coordinates for each keypoint (e.g., pixel coords).
     """
     node_ids: np.ndarray
     keypoint_labels: np.ndarray
     keypoint_scores: np.ndarray
     adjacency_matrix: np.ndarray
+    keypoint_coords: Optional[np.ndarray] = None
 
 
-# MergeFn is a callable that takes two InstanceGroup objects, two node indices (u, v),
-# and a relation type integer, and returns a merged InstanceGroup or None if merging is not possible.
-MergeFn = Callable[[InstanceGroup, InstanceGroup, int, int, int], Optional[InstanceGroup]]
+# CheckMergeFn is a callable that takes two InstanceGroup objects, two node indices (u, v),
+# and a relation type integer, and returns True iff the groups may be merged.
+CheckMergeFn = Callable[[InstanceGroup, InstanceGroup, int, int, int], bool]
 
 
 def group_keypoints_into_instances(
     keypoint_labels: np.ndarray,
     keypoint_scores: np.ndarray,
     relation_scores: np.ndarray,
-    merge_fn: MergeFn,
+    check_merge: CheckMergeFn,
+    keypoint_coords: Optional[np.ndarray] = None,
     min_edge_score: float = 0.0,
 ) -> List[InstanceGroup]:
     """Group keypoints using a single descending pass over relation scores.
@@ -34,18 +37,26 @@ def group_keypoints_into_instances(
         keypoint_labels: (N,) integer labels.
         keypoint_scores: (N,) scores.
         relation_scores: (N, N, R) relation score tensor (R >= 1).
-        merge_fn: (grp_u, grp_v, u, v, rel_type) -> merged InstanceGroup or None.
-                  u, v are global node indices. rel_type is argmax relation type for (u,v).
+        check_merge: (grp_u, grp_v, u, v, rel_type) -> bool. If True, groups are merged.
+                    u, v are global node indices. rel_type is argmax relation type for (u,v).
+        keypoint_coords: Optional (N,2) coordinates corresponding to each keypoint.
         min_edge_score: Minimum edge score required to consider merging two groups.
 
     Returns:
         List of final InstanceGroup objects.
     """
+    # TODO: This algorithm groups greedily based on max relation scores.
+    # This means connectivity between two groups is determined by the maximum scoring edge only,
+    # which may not be optimal. A more robust approach could consider the average of all edges between two groups.
+
+
     assert keypoint_labels.ndim == 1
     assert keypoint_scores.ndim == 1 and keypoint_scores.shape[0] == keypoint_labels.shape[0]
     assert relation_scores.ndim == 3, "relation_scores must be (N,N,R)"
     N, N2, R = relation_scores.shape
     assert N == N2, "relation_scores must be square in first two dims"
+    if keypoint_coords is not None:
+        assert keypoint_coords.shape == (N, 2), "keypoint_coords must be (N,2)"
     if N == 0:
         return []
 
@@ -56,7 +67,8 @@ def group_keypoints_into_instances(
             node_ids=np.array([i], dtype=np.int32),
             keypoint_labels=np.array([keypoint_labels[i]], dtype=keypoint_labels.dtype),
             keypoint_scores=np.array([keypoint_scores[i]], dtype=keypoint_scores.dtype),
-            adjacency_matrix=np.zeros((1, 1, R), dtype=relation_scores.dtype)
+            adjacency_matrix=np.zeros((1, 1, R), dtype=relation_scores.dtype),
+            keypoint_coords=(None if keypoint_coords is None else np.array([keypoint_coords[i]], dtype=keypoint_coords.dtype))
         ))
     node_to_group = np.arange(N)  # global node id -> index into groups list
 
@@ -84,9 +96,9 @@ def group_keypoints_into_instances(
 
         group_u = groups[group_u_idx]
         group_v = groups[group_v_idx]
-        merged_group = merge_fn(group_u, group_v, int(u), int(v), int(rel_type))
-        if merged_group is None:
+        if not check_merge(group_u, group_v, int(u), int(v), int(rel_type)):
             continue
+        merged_group = _merge_groups(group_u, group_v, relation_scores)
 
         # Place merged group in slot group_u_idx, remove group_v_idx via swap-delete
         groups[group_u_idx] = merged_group
@@ -100,6 +112,33 @@ def group_keypoints_into_instances(
         groups.pop()
 
     return groups
+
+
+def make_check_merge_max_label(max_per_label) -> CheckMergeFn:
+    """
+    Factory function to create a check_merge function that allows merging two groups only if the resulting group
+    does not exceed the maximum allowed number of keypoints per label.
+
+    Args:
+        max_per_label (dict or int): If dict, maps label to max count. If int, all labels share the same max.
+
+    Returns:
+        CheckMergeFn: A function that returns True if merging the two groups would not violate per-label limits.
+    """
+    def check_merge(grp_u, grp_v, u, v, rel_type):
+        merged_labels = np.concatenate([grp_u.keypoint_labels, grp_v.keypoint_labels])
+        # Count occurrences per label
+        unique, counts = np.unique(merged_labels, return_counts=True)
+        if isinstance(max_per_label, int):
+            if np.any(counts > max_per_label):
+                return False
+        else:
+            for lbl, cnt in zip(unique, counts):
+                if cnt > max_per_label.get(int(lbl), max(counts)):
+                    return False
+        return True
+    return check_merge
+
 
 
 def _merge_groups(
@@ -150,87 +189,28 @@ def _merge_groups(
         adj[:Ka, Ka:, :] = cross
         adj[Ka:, :Ka, :] = np.transpose(cross, (1, 0, 2))
 
+    # Merge coords: if neither group has coords -> None, otherwise concatenate,
+    # filling missing coords with NaNs to preserve ordering.
+    if grp_a.keypoint_coords is None and grp_b.keypoint_coords is None:
+        new_coords = None
+    else:
+        a_coords = grp_a.keypoint_coords if grp_a.keypoint_coords is not None else np.full((Ka, 2), np.nan, dtype=float)
+        b_coords = grp_b.keypoint_coords if grp_b.keypoint_coords is not None else np.full((Kb, 2), np.nan, dtype=float)
+        new_coords = np.concatenate([a_coords, b_coords], axis=0)
+
     return InstanceGroup(
         node_ids=new_node_ids,
         keypoint_labels=new_labels,
         keypoint_scores=new_scores,
-        adjacency_matrix=adj
+        adjacency_matrix=adj,
+        keypoint_coords=new_coords
     )
 
-
-def make_merge_fn_max_label(max_per_label, relation_scores: Optional[np.ndarray] = None) -> MergeFn:
-    """
-    Factory function to create a merge function that merges two groups only if the resulting group
-    does not exceed the maximum allowed number of keypoints per label.
-
-    Args:
-        max_per_label (dict or int): If dict, maps label to max count. If int, all labels share the same max.
-        relation_scores (Optional[np.ndarray]): Global relation scores array for adjacency matrix.
-
-    Returns:
-        MergeFn: A function that attempts to merge two groups (grp_u, grp_v) if the merged group
-        does not exceed the max count for any label. Returns None if the limit is exceeded.
-    """
-    def merge_fn(grp_u, grp_v, u, v, rel_type):
-        merged_labels = np.concatenate([grp_u.keypoint_labels, grp_v.keypoint_labels])
-        # Count occurrences per label
-        unique, counts = np.unique(merged_labels, return_counts=True)
-        if isinstance(max_per_label, int):
-            if np.any(counts > max_per_label):
-                return None
-        else:
-            for lbl, cnt in zip(unique, counts):
-                if cnt > max_per_label.get(int(lbl), max(counts)):
-                    return None
-        return _merge_groups(grp_u, grp_v, relation_scores)
-    return merge_fn
-
-
-def make_merge_fn_max_degree_per_label(
-    max_degree_per_label: dict,
-    relation_scores: np.ndarray,
-) -> MergeFn:
-
-    num_nodes = relation_scores.shape[0]
-    node_degrees = np.zeros(num_nodes, dtype=np.int32)
-
-    def _label_from_groups(grp_u: InstanceGroup, grp_v: InstanceGroup, node_id: int):
-        for g in (grp_u, grp_v):
-            idx = np.where(g.node_ids == node_id)[0]
-            if idx.size:
-                return g.keypoint_labels[idx[0]]
-        return None  # should not happen
-
-    def merge_fn(grp_u: InstanceGroup, grp_v: InstanceGroup, u: int, v: int, rel_type: int):
-        label_u = _label_from_groups(grp_u, grp_v, u)
-        label_v = _label_from_groups(grp_u, grp_v, v)
-        max_deg_u = max_degree_per_label.get(int(label_u), np.inf)
-        max_deg_v = max_degree_per_label.get(int(label_v), np.inf)
-
-        if node_degrees[u] >= max_deg_u or node_degrees[v] >= max_deg_v:
-            return None
-
-        merged = _merge_groups(grp_u, grp_v)
-        new_ids = merged.node_ids
-        idx_u = int(np.where(new_ids == u)[0][0])
-        idx_v = int(np.where(new_ids == v)[0][0])
-
-        # Set adjacency between u and v from global relation_scores
-        rel_vec = relation_scores[u, v, :]
-        merged.adjacency_matrix[idx_u, idx_v, :] = rel_vec
-        merged.adjacency_matrix[idx_v, idx_u, :] = rel_vec
-
-        node_degrees[u] += 1
-        node_degrees[v] += 1
-        return merged
-
-    return merge_fn
 
 
 __all__ = [
     "InstanceGroup",
     "group_keypoints_into_instances",
-    "MergeFn",
-    "make_merge_fn_max_label",
-    "make_merge_fn_max_degree_per_label",
+    "CheckMergeFn",
+    "make_check_merge_max_label",
 ]
