@@ -101,7 +101,7 @@ def predinstances2dict(pred_instances: PredType) -> dict:
     """
     pred_instances = pred_instances.numpy()
     return {
-        'keypoint_label_names': pred_instances.label_names,
+        'keypoint_label_names': [l.strip() for l in pred_instances.label_names],
         'keypoint_labels': pred_instances.labels.tolist(),
         'keypoint_scores': pred_instances.scores.tolist(),
         'keypoint_coords': pred_instances.keypoints.tolist(),

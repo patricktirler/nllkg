@@ -6,16 +6,18 @@ import numpy as np
 class InstanceGroup:
     """Grouped keypoints represented explicitly by arrays.
     node_ids: (K,) global indices of the keypoints in this instance.
-    keypoint_labels: (K,) labels corresponding to node_ids order.
     keypoint_scores: (K,) scores corresponding to node_ids order.
     adjacency_matrix: (K, K, R) relation scores subset for these nodes.
+    keypoint_labels: Optional (K,) labels corresponding to node_ids order.
     keypoint_coords: Optional (K, 2) coordinates for each keypoint (e.g., pixel coords).
+    keypoint_label_names: Optional (K,) string names corresponding to keypoint labels.
     """
     node_ids: np.ndarray
-    keypoint_labels: np.ndarray
     keypoint_scores: np.ndarray
     adjacency_matrix: np.ndarray
+    keypoint_labels: Optional[np.ndarray] = None
     keypoint_coords: Optional[np.ndarray] = None
+    keypoint_label_names: Optional[np.ndarray] = None
 
 
 # CheckMergeFn is a callable that takes two InstanceGroup objects, two node indices (u, v),
@@ -24,22 +26,26 @@ CheckMergeFn = Callable[[InstanceGroup, InstanceGroup, int, int, int], bool]
 
 
 def group_keypoints_into_instances(
-    keypoint_labels: np.ndarray,
     keypoint_scores: np.ndarray,
     relation_scores: np.ndarray,
     check_merge: CheckMergeFn,
+    keypoint_labels: Optional[np.ndarray] = None,
     keypoint_coords: Optional[np.ndarray] = None,
+    keypoint_label_names: Optional[np.ndarray] = None,
+    keypoint_score_threshold: float = 0.0,
     min_edge_score: float = 0.0,
 ) -> List[InstanceGroup]:
     """Group keypoints using a single descending pass over relation scores.
 
     Args:
-        keypoint_labels: (N,) integer labels.
         keypoint_scores: (N,) scores.
         relation_scores: (N, N, R) relation score tensor (R >= 1).
         check_merge: (grp_u, grp_v, u, v, rel_type) -> bool. If True, groups are merged.
                     u, v are global node indices. rel_type is argmax relation type for (u,v).
+        keypoint_labels: Optional (N,) integer labels.
         keypoint_coords: Optional (N,2) coordinates corresponding to each keypoint.
+        keypoint_label_names: Optional (N,) string names corresponding to keypoint labels.
+        keypoint_score_threshold: Minimum score for keypoints to be considered.
         min_edge_score: Minimum edge score required to consider merging two groups.
 
     Returns:
@@ -50,13 +56,28 @@ def group_keypoints_into_instances(
     # which may not be optimal. A more robust approach could consider the average of all edges between two groups.
 
 
-    assert keypoint_labels.ndim == 1
-    assert keypoint_scores.ndim == 1 and keypoint_scores.shape[0] == keypoint_labels.shape[0]
+    assert keypoint_labels is None or keypoint_labels.ndim == 1
+    assert keypoint_scores.ndim == 1
+    if keypoint_labels is not None:
+        assert keypoint_scores.shape[0] == keypoint_labels.shape[0]
     assert relation_scores.ndim == 3, "relation_scores must be (N,N,R)"
     N, N2, R = relation_scores.shape
     assert N == N2, "relation_scores must be square in first two dims"
     if keypoint_coords is not None:
         assert keypoint_coords.shape == (N, 2), "keypoint_coords must be (N,2)"
+    
+    # Filter keypoints by score threshold
+    keep = keypoint_scores >= keypoint_score_threshold
+    keypoint_scores = keypoint_scores[keep]
+    if keypoint_labels is not None:
+        keypoint_labels = keypoint_labels[keep]
+    if keypoint_coords is not None:
+        keypoint_coords = keypoint_coords[keep]
+    if keypoint_label_names is not None:
+        keypoint_label_names = [keypoint_label_names[i] for i in np.nonzero(keep)[0]]
+    relation_scores = relation_scores[np.ix_(keep, keep, np.arange(R))]
+    N = keypoint_scores.shape[0]
+
     if N == 0:
         return []
 
@@ -65,10 +86,11 @@ def group_keypoints_into_instances(
     for i in range(N):
         groups.append(InstanceGroup(
             node_ids=np.array([i], dtype=np.int32),
-            keypoint_labels=np.array([keypoint_labels[i]], dtype=keypoint_labels.dtype),
+            keypoint_labels=(None if keypoint_labels is None else np.array([keypoint_labels[i]], dtype=keypoint_labels.dtype)),
             keypoint_scores=np.array([keypoint_scores[i]], dtype=keypoint_scores.dtype),
             adjacency_matrix=np.zeros((1, 1, R), dtype=relation_scores.dtype),
-            keypoint_coords=(None if keypoint_coords is None else np.array([keypoint_coords[i]], dtype=keypoint_coords.dtype))
+            keypoint_coords=(None if keypoint_coords is None else np.array([keypoint_coords[i]], dtype=keypoint_coords.dtype)),
+            keypoint_label_names = (None if keypoint_label_names is None else np.array([keypoint_label_names[i]]))
         ))
     node_to_group = np.arange(N)  # global node id -> index into groups list
 
@@ -169,7 +191,7 @@ def _merge_groups(
         New merged InstanceGroup with combined metadata and adjacency.
     """
     new_node_ids = np.concatenate([grp_a.node_ids, grp_b.node_ids])
-    new_labels = np.concatenate([grp_a.keypoint_labels, grp_b.keypoint_labels])
+    new_labels = None if (grp_a.keypoint_labels is None or grp_b.keypoint_labels is None) else np.concatenate([grp_a.keypoint_labels, grp_b.keypoint_labels])
     new_scores = np.concatenate([grp_a.keypoint_scores, grp_b.keypoint_scores])
 
     Ka = grp_a.node_ids.size
@@ -198,12 +220,21 @@ def _merge_groups(
         b_coords = grp_b.keypoint_coords if grp_b.keypoint_coords is not None else np.full((Kb, 2), np.nan, dtype=float)
         new_coords = np.concatenate([a_coords, b_coords], axis=0)
 
+    # Merge label names: concatenate if present in either group.
+    if grp_a.keypoint_label_names is None and grp_b.keypoint_label_names is None:
+        new_label_names = None
+    else:
+        a_names = grp_a.keypoint_label_names if grp_a.keypoint_label_names is not None else np.full(Ka, "", dtype=object)
+        b_names = grp_b.keypoint_label_names if grp_b.keypoint_label_names is not None else np.full(Kb, "", dtype=object)
+        new_label_names = np.concatenate([a_names, b_names], axis=0)
+
     return InstanceGroup(
         node_ids=new_node_ids,
         keypoint_labels=new_labels,
         keypoint_scores=new_scores,
         adjacency_matrix=adj,
-        keypoint_coords=new_coords
+        keypoint_coords=new_coords,
+        keypoint_label_names=new_label_names
     )
 
 
