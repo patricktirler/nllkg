@@ -23,6 +23,7 @@ def inference_multicrop(
     img_dir: str,
     texts: str,
     relation_texts: str,
+    keypoint_score_threshold: float = 0.3,
 ):
     """
     Perform multi-scale crop-based inference on images and save a single JSON per image.
@@ -56,6 +57,7 @@ def inference_multicrop(
         Entity prompt text passed to the model.
     relation_texts : str
         Relation prompt text passed to the model.
+    keypoint_score_threshold : float, default=0.3
     """
     temp_dir = os.path.join(work_dir, "_tmp_crops")
     os.makedirs(save_dir, exist_ok=True)
@@ -121,21 +123,44 @@ def inference_multicrop(
                         res["predictions"][0].pred_instances
                     )
 
-                    # Translate keypoints to full-image coordinates
-                    kp = np.array(rdict["keypoint_coords"])
-                    kp[:, 0] += x1
-                    kp[:, 1] += y1
-                    rdict["keypoint_coords"] = kp.tolist()
+                    kp_coords = np.asarray(rdict.get("keypoint_coords", []))
+                    kp_scores = np.asarray(rdict.get("keypoint_scores", []))
+                    kp_labels = rdict.get("keypoint_label_names", [])
+                    rel_scores = np.asarray(
+                        rdict.get("keypoint_relation_scores", [])
+                    )
+
+                    if len(kp_coords) == 0:
+                        continue
+
+                    # --------------------------------------------------
+                    # Keypoint score thresholding (DROP-IN)
+                    # --------------------------------------------------
+                    keep = kp_scores >= keypoint_score_threshold
+
+                    kp_coords = kp_coords[keep]
+                    kp_scores = kp_scores[keep]
+                    kp_labels = [kp_labels[i] for i, k in enumerate(keep) if k]
+
+                    if rel_scores.size > 0:
+                        rel_scores = rel_scores[np.ix_(keep, keep)]
+
+                    # --------------------------------------------------
+                    # Translate to full-image coordinates
+                    # --------------------------------------------------
+                    kp_coords[:, 0] += x1
+                    kp_coords[:, 1] += y1
 
                     crop_results_by_size[crop_key].append({
-                        "keypoint_coords": rdict.get("keypoint_coords", []),
-                        "keypoint_scores": rdict.get("keypoint_scores", []),
-                        "keypoint_label_names": rdict.get("keypoint_label_names", []),
+                        "keypoint_coords": kp_coords.tolist(),
+                        "keypoint_scores": kp_scores.tolist(),
+                        "keypoint_label_names": kp_labels,
                         "keypoint_relation_scores": (
-                            rdict.get("keypoint_relation_scores")
+                            rel_scores.tolist() if rel_scores.size > 0 else []
                         ),
                         "crop_bbox": (x1, y1, x2, y2),
                     })
+
 
             # Save ONCE per image
             save_image_inference_results(
@@ -344,38 +369,38 @@ def fit_shapes_multicrop(
             f"Crop size '{crop_size_key}' not found in inference results. "
             f"Available sizes: {list(crop_results_by_size.keys())}"
         )
-
+    
     crop_results = crop_results_by_size[crop_size_key]
 
     # Aggregate keypoints across all crops
     all_coords = []
     all_scores = []
-    all_labels = []
+    all_label_names = []
 
     for c in crop_results:
         coords = np.asarray(c.get("keypoint_coords", []))
         scores = np.asarray(c.get("keypoint_scores", []))
-        labels = [l.strip() for l in c.get("keypoint_label_names", [])]
+        label_names = [l.strip() for l in c.get("keypoint_label_names", [])]
 
         if len(coords) == 0:
             continue
 
         all_coords.append(coords)
         all_scores.append(scores)
-        all_labels.extend(labels)
+        all_label_names.extend(label_names)
 
     if not all_coords:
         return []
 
     kp_coords = np.concatenate(all_coords, axis=0)
     kp_scores = np.concatenate(all_scores, axis=0)
-    kp_labels = np.asarray(all_labels)
+    kp_label_names = np.asarray(all_label_names)
 
     # Refine templates using keypoint-based fitting
     refined_templates = fit_shapes_with_keypoints(
         keypoint_scores=kp_scores,
         keypoint_coords=kp_coords,
-        keypoint_label_names=kp_labels,
+        keypoint_label_names=kp_label_names,
         template_keypoints=templates,
         dof=dof,
         keypoint_score_threshold=keypoint_score_threshold,

@@ -78,33 +78,36 @@ def _refine_single_template(
     template_coords = template.keypoint_coords
     template_label_names = template.keypoint_label_names
     
+    # --- Pivot Logic ---
+    # Calculate centroid to use as the center for rotation and scaling
+    centroid = np.mean(template_coords, axis=0)
+    centered_coords = template_coords - centroid
+
     def objective(params):
         T = _params_to_matrix(params, dof)
         
-        # Transform template points
-        template_h = np.hstack([template_coords, np.ones((template_coords.shape[0], 1))])
-        transformed = template_h @ T.T  # (M, 2)
+        # Transform: (X - center) * R' * S' + center + translation
+        # This keeps the shape spinning in place
+        transformed = centered_coords @ T[:, :2].T + (centroid + T[:, 2])
         
         # Create label matching mask: (M, N)
-        label_mask = template_label_names[:, np.newaxis] == obs_label_names[np.newaxis, :]  # (M, N)
+        label_mask = template_label_names[:, np.newaxis] == obs_label_names[np.newaxis, :]
         
         # Compute distances: (M, N)
-        diff = transformed[:, np.newaxis, :] - obs_coords[np.newaxis, :, :]  # (M, N, 2)
-        dist_sq = np.sum(diff**2, axis=-1)  # (M, N)
+        diff = transformed[:, np.newaxis, :] - obs_coords[np.newaxis, :, :]
+        dist_sq = np.sum(diff**2, axis=-1)
         
-        # Compute likelihoods and zero out non-matching labels
-        likelihoods = obs_scores * np.exp(-dist_sq / (2 * sigma**2))  # (M, N)
-        likelihoods = likelihoods * label_mask  # (M, N)
+        # Compute likelihoods
+        likelihoods = obs_scores * np.exp(-dist_sq / (2 * sigma**2))
+        likelihoods = likelihoods * label_mask
         
         return -np.sum(likelihoods)
     
     opt_result = minimize(objective, initial_params, method="L-BFGS-B",
                          options={"maxiter": 100})
     
-    # Transform template with optimized parameters
     T = _params_to_matrix(opt_result.x, dof)
-    template_h = np.hstack([template_coords, np.ones((template_coords.shape[0], 1))])
-    refined_coords = template_h @ T.T
+    refined_coords = centered_coords @ T[:, :2].T + (centroid + T[:, 2])
     
     return ShapeTemplate(
         keypoint_coords=refined_coords,
