@@ -5,13 +5,14 @@ from collections import Counter
 
 from mmpose.evaluation.metrics.keypoint_2d_metrics import PCKAccuracy
 from mmdet.registry import METRICS
-from tools.graph_grouping import (
+from mmengine.logging import MMLogger
+from mmpose.evaluation.functional import keypoint_pck_accuracy
+
+from ...tools.graph_grouping import (
     group_keypoints_into_instances,
     make_check_merge_max_label,
 )
-from tools.graph_matching import sequential_matching
-from mmengine.logging import MMLogger
-from mmpose.evaluation.functional import keypoint_pck_accuracy
+from ...tools.graph_matching import sequential_matching
 
 
 @METRICS.register_module()

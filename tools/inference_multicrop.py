@@ -5,17 +5,18 @@ from typing import Dict, List, Tuple
 import cv2
 import numpy as np
 
+from mmengine.config import Config
 import matplotlib.pyplot as plt
 from matplotlib import cm
 
-from datasets.keypointgraph_dataset import generate_crop_coordinates
-from tools.inference import predinstances2dict, OpenVocPoseInferencer
-from tools.graph_grouping import group_keypoints_into_instances, InstanceGroup, CheckMergeFn
-from tools.graph_fitting import ShapeTemplate, fit_shapes_with_keypoints
+from nllkp.datasets.keypointgraph_dataset import generate_crop_coordinates
+from nllkp.tools.inference import predinstances2dict, OpenVocPoseInferencer
+from nllkp.tools.graph_grouping import group_keypoints_into_instances, InstanceGroup, CheckMergeFn
+from nllkp.tools.graph_fitting import ShapeTemplate, fit_shapes_with_keypoints
 
 
 def inference_multicrop(
-    cfg,
+    cfg_path,
     weights: str,
     work_dir: str,
     save_dir: str,
@@ -61,10 +62,11 @@ def inference_multicrop(
     os.makedirs(temp_dir, exist_ok=True)
 
     inferencer = OpenVocPoseInferencer(
-        model=str(cfg),
+        model=cfg_path,
         weights=weights,
         device='cuda:0',
     )
+    cfg = Config.fromfile(cfg_path)
 
     try:
         for img_name in sorted(os.listdir(img_dir)):
@@ -456,10 +458,10 @@ def visualize_multicrop(
     for crop in largest_crop_results:
         kp_coords = np.asarray(crop.get("keypoint_coords", []))
         kp_scores = np.asarray(crop.get("keypoint_scores", []))
-        kp_labels = crop.get("keypoint_labels", [])
+        kp_label_names = crop.get("keypoint_label_names", [])
         keep = kp_scores >= keypoint_score_threshold
         kp_coords = kp_coords[keep]
-        kp_labels = [kp_labels[i] for i, k in enumerate(keep) if k]
+        kp_label_names = [kp_label_names[i] for i, k in enumerate(keep) if k]
 
         if len(kp_coords) == 0:
             continue
@@ -478,7 +480,7 @@ def visualize_multicrop(
                             color = REL_COLORS[r % len(REL_COLORS)]
                             cv2.line(vis_crops, p1, p2, color, int(0.5 + 2 * score))
 
-        vis_crops = _draw_keypoints_cv2(vis_crops, kp_coords, kp_labels, label_to_color)
+        vis_crops = _draw_keypoints_cv2(vis_crops, kp_coords, kp_label_names, label_to_color)
 
     # ------------------------------------------------------------------
     # Subplot 2: Instance groups + initial shapes
@@ -520,12 +522,12 @@ def visualize_multicrop(
     for crop in smallest_crop_results:
         kp_coords = np.asarray(crop.get("keypoint_coords", []))
         kp_scores = np.asarray(crop.get("keypoint_scores", []))
-        kp_labels = crop.get("keypoint_labels", [])
+        kp_label_names = crop.get("keypoint_label_names", [])
         keep = kp_scores >= keypoint_score_threshold
         kp_coords = kp_coords[keep]
-        kp_labels = [kp_labels[i] for i, k in enumerate(keep) if k]
+        kp_label_names = [kp_label_names[i] for i, k in enumerate(keep) if k]
         if len(kp_coords) > 0:
-            vis_fits = _draw_keypoints_cv2(vis_fits, kp_coords, kp_labels, label_to_color)
+            vis_fits = _draw_keypoints_cv2(vis_fits, kp_coords, kp_label_names, label_to_color)
 
     for template in fits:
         _draw_shape_template(vis_fits, template, color=(255, 0, 0))

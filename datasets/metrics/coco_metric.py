@@ -4,7 +4,7 @@ from typing import Dict, List, Sequence, Any, Optional
 from mmpose.evaluation.metrics.coco_metric import CocoMetric
 from mmdet.registry import METRICS
 
-from tools.graph_grouping import (
+from ...tools.graph_grouping import (
     group_keypoints_into_instances,
     make_check_merge_max_label,
 )

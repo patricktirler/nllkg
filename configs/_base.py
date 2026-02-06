@@ -1,6 +1,6 @@
 _base_ = 'mmdet::grounding_dino/grounding_dino_swin-t_finetune_16xb2_1x_coco.py'
 
-custom_imports = dict(imports=['models', 'datasets', 'tools'])
+custom_imports = dict(imports=['nllkp'])
 
 dataset_type = 'KeypointGraphDataset'
 
