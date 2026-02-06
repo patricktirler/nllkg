@@ -33,7 +33,7 @@ model = dict(
             use_sigmoid=True,
             gamma=2.0,
             alpha=0.25,
-            loss_weight=5.0
+            loss_weight=10.0
         )
     ),
     train_cfg=dict(
