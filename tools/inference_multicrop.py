@@ -4,6 +4,7 @@ from typing import Dict, List, Tuple
 
 import cv2
 import numpy as np
+import shutil
 
 from mmengine.config import Config
 import matplotlib.pyplot as plt
@@ -15,6 +16,7 @@ from nllkp.tools.graph_grouping import group_keypoints_into_instances, InstanceG
 from nllkp.tools.graph_fitting import ShapeTemplate, fit_shapes_with_keypoints
 
 
+
 def inference_multicrop(
     cfg_path,
     weights: str,
@@ -24,6 +26,8 @@ def inference_multicrop(
     texts: str,
     relation_texts: str,
     keypoint_score_threshold: float = 0.3,
+    batch_size: int = 1,
+    progressive_crop_filtering: bool = False,
 ):
     """
     Perform multi-scale crop-based inference on images and save a single JSON per image.
@@ -39,12 +43,8 @@ def inference_multicrop(
 
     Parameters
     ----------
-    cfg : object
-        Configuration object containing crop parameters:
-        - crop_sizes : List[Tuple[int, int]]
-            List of (crop_height, crop_width) pairs.
-        - min_crop_overlap : float
-            Minimum overlap ratio between adjacent crops.
+    cfg_path : str
+        Path to configuration file.
     weights : str
         Path to model weights file for inference.
     work_dir : str
@@ -58,6 +58,12 @@ def inference_multicrop(
     relation_texts : str
         Relation prompt text passed to the model.
     keypoint_score_threshold : float, default=0.3
+        Minimum score threshold for keypoint detections.
+    batch_size : int, default=1
+        Batch size for inference.
+    progressive_crop_filtering : bool, default=False
+        If True, sort crop sizes by area (largest first) and only perform inference
+        on smaller crop sizes if keypoints were detected in the larger crop size.
     """
     temp_dir = os.path.join(work_dir, "_tmp_crops")
     os.makedirs(save_dir, exist_ok=True)
@@ -69,6 +75,14 @@ def inference_multicrop(
         device='cuda:0',
     )
     cfg = Config.fromfile(cfg_path)
+
+    crop_sizes = cfg.crop_sizes
+    if progressive_crop_filtering:
+        crop_sizes = sorted(
+            crop_sizes,
+            key=lambda s: s[0] * s[1],
+            reverse=True,
+        )
 
     try:
         for img_name in sorted(os.listdir(img_dir)):
@@ -83,10 +97,9 @@ def inference_multicrop(
             img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             h, w = img.shape[:2]
 
-            # Accumulate results for ALL crop sizes
+        
             crop_results_by_size = {}
-
-            for crop_size in cfg.crop_sizes:
+            for crop_idx, crop_size in enumerate(crop_sizes):
                 crop_key = f"{crop_size[1]}x{crop_size[0]}"
                 crop_results_by_size[crop_key] = []
 
@@ -96,32 +109,91 @@ def inference_multicrop(
                     cfg.min_crop_overlap,
                 )
 
+                # If progressive filtering is enabled and we're not on the first crop size,
+                # filter crops to only those that have keypoints from the previous crop size
+                if progressive_crop_filtering and crop_idx > 0:
+                    # Gather keypoints from previous crop size results
+                    previous_crop_key = f"{crop_sizes[crop_idx - 1][1]}x{crop_sizes[crop_idx - 1][0]}"
+                    previous_keypoints = []
+                    for result in crop_results_by_size[previous_crop_key]:
+                        previous_keypoints.extend(result["keypoint_coords"])
+                    
+                    if previous_keypoints:
+                        previous_keypoints = np.asarray(previous_keypoints)
+                        
+                        # Vectorized check: for each crop, check if any keypoint falls within
+                        filtered_crops = []
+                        for x1, y1, x2, y2 in crops:
+                            if np.any(
+                                (previous_keypoints[:, 0] >= x1) &
+                                (previous_keypoints[:, 0] <= x2) &
+                                (previous_keypoints[:, 1] >= y1) &
+                                (previous_keypoints[:, 1] <= y2)
+                            ):
+                                filtered_crops.append((x1, y1, x2, y2))
+                        
+                        if not filtered_crops:
+                            print(
+                                f"Skipping crop size {crop_key} for {img_name} "
+                                "(no keypoints from larger crops overlap with this size)"
+                            )
+                            continue
+                        
+                        crops = filtered_crops
+                    else:
+                        print(
+                            f"Skipping crop size {crop_key} for {img_name} "
+                            "(no keypoints from larger crops)"
+                        )
+                        continue
+
+                # Folder for this crop size
+                crop_folder = os.path.join(
+                    temp_dir, img_name, crop_key
+                )
+                os.makedirs(crop_folder, exist_ok=True)
+
+                crop_paths = []
+                crop_bboxes = []
+
+                # Save all crops first
                 for ci, (x1, y1, x2, y2) in enumerate(crops):
                     crop = img_rgb[y1:y2, x1:x2]
 
                     crop_path = os.path.join(
-                        temp_dir,
-                        f"{img_name[:-4]}_{crop_key}_{ci}.jpg",
+                        crop_folder,
+                        f"{ci:05d}.jpg"
                     )
                     cv2.imwrite(
                         crop_path,
                         cv2.cvtColor(crop, cv2.COLOR_RGB2BGR),
                     )
 
-                    res = inferencer(
-                        crop_path,
-                        texts=texts,
-                        relation_texts=relation_texts,
-                        return_datasamples=True,
-                        no_save_vis=True,
-                        no_save_pred=True,
-                        pred_score_thr=0.3,
-                        custom_entities=True,
-                    )
+                    crop_paths.append(crop_path)
+                    crop_bboxes.append((x1, y1, x2, y2))
 
-                    rdict = predinstances2dict(
-                        res["predictions"][0].pred_instances
-                    )
+                # ------------------------------------------------------
+                # SINGLE BATCHED INFERENCE CALL
+                # ------------------------------------------------------
+                res = inferencer(
+                    crop_folder,
+                    texts=texts,
+                    relation_texts=relation_texts,
+                    batch_size=batch_size,
+                    return_datasamples=True,
+                    no_save_vis=True,
+                    no_save_pred=True,
+                    pred_score_thr=keypoint_score_threshold,
+                    custom_entities=True,
+                )
+
+                # ------------------------------------------------------
+                # PROCESS RESULTS
+                # ------------------------------------------------------
+                predictions = res["predictions"]
+
+                for pred, (x1, y1, x2, y2) in zip(predictions, crop_bboxes):
+                    rdict = predinstances2dict(pred.pred_instances)
 
                     kp_coords = np.asarray(rdict.get("keypoint_coords", []))
                     kp_scores = np.asarray(rdict.get("keypoint_scores", []))
@@ -133,11 +205,8 @@ def inference_multicrop(
                     if len(kp_coords) == 0:
                         continue
 
-                    # --------------------------------------------------
-                    # Keypoint score thresholding (DROP-IN)
-                    # --------------------------------------------------
+                    # Thresholding
                     keep = kp_scores >= keypoint_score_threshold
-
                     kp_coords = kp_coords[keep]
                     kp_scores = kp_scores[keep]
                     kp_labels = [kp_labels[i] for i, k in enumerate(keep) if k]
@@ -145,9 +214,7 @@ def inference_multicrop(
                     if rel_scores.size > 0:
                         rel_scores = rel_scores[np.ix_(keep, keep)]
 
-                    # --------------------------------------------------
                     # Translate to full-image coordinates
-                    # --------------------------------------------------
                     kp_coords[:, 0] += x1
                     kp_coords[:, 1] += y1
 
@@ -161,8 +228,7 @@ def inference_multicrop(
                         "crop_bbox": (x1, y1, x2, y2),
                     })
 
-
-            # Save ONCE per image
+            # Save final JSON
             save_image_inference_results(
                 img_name,
                 crop_results_by_size,
@@ -172,16 +238,9 @@ def inference_multicrop(
             print(f"Saved inference JSON for {img_name}")
 
     finally:
-        # Cleanup temp crops
-        for f in os.listdir(temp_dir):
-            try:
-                os.remove(os.path.join(temp_dir, f))
-            except Exception:
-                pass
-        try:
-            os.rmdir(temp_dir)
-        except Exception:
-            pass
+        # Cleanup
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
 
 def save_image_inference_results(
     img_name: str,
@@ -307,7 +366,7 @@ def group_keypoints_multicrop(
 def fit_shapes_multicrop(
     inference_json_path: str,
     templates: List[ShapeTemplate],
-    dof: str = "trs",
+    dof: str = "trsxsy",
     crop_size_key: str | None = None,
     keypoint_score_threshold: float = 0.3,
     sigma: float = 10.0,

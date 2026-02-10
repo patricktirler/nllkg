@@ -60,6 +60,9 @@ def group_keypoints_into_instances(
     assert keypoint_scores.ndim == 1
     if keypoint_labels is not None:
         assert keypoint_scores.shape[0] == keypoint_labels.shape[0]
+    if keypoint_scores.shape[0] == 0:
+        return []
+
     assert relation_scores.ndim == 3, "relation_scores must be (N,N,R)"
     N, N2, R = relation_scores.shape
     assert N == N2, "relation_scores must be square in first two dims"
