@@ -55,7 +55,7 @@ class KeypointRelationMetric(BaseMetric):
             img_w = int(data_sample['ori_shape'][1])
             img_h = int(data_sample['ori_shape'][0])
             max_dim = max(img_w, img_h)
-            
+
             # Handle cropped images
             crop_bbox = data_sample.get('crop_bbox', None)
             gt_coords = data_sample['gt_instances']['keypoint_coords'].cpu().numpy().reshape(-1, 2)
@@ -96,6 +96,7 @@ class KeypointRelationMetric(BaseMetric):
                 pred_labels=np.array(pred['label_names']),
                 pred_scores=pred['scores'].cpu().numpy(),
                 pred_relations=pred['relation_scores'].cpu().numpy(),
+                crop_bbox=crop_bbox,
             )
             self.results.append(record)
             
@@ -192,26 +193,154 @@ class KeypointRelationMetric(BaseMetric):
         logger.info("")
 
         # 2) Keypoint recall vs distance thresholds at fixed keypoint score
-        recalls_by_dist_arr = compute_recall(
-            gt_coords_list=gt_coords_list,
-            gt_labels_list=gt_labels_list,
-            pred_coords_list=pred_coords_list,
-            pred_labels_list=pred_labels_list,
-            pred_scores_list=pred_scores_list,
-            max_dim_list=max_dim_list,
-            distance_threshold_norm=self.distance_thresholds,
-            score_threshold=self.keypoint_score_threshold,
-            distances_list=distances_list,
+        logger.info(
+            "Keypoints: Recall@distance grouped by crop size and label name (score>=%.2f)",
+            self.keypoint_score_threshold
         )
-        recalls_by_dist_arr = np.asarray(recalls_by_dist_arr, dtype=float)
-        recall_by_distance = {t: float(recalls_by_dist_arr[i]) for i, t in enumerate(self.distance_thresholds)}
 
-        logger.info("Keypoints: Recall@distance (score>=%.2f)", self.keypoint_score_threshold)
-        for t in self.distance_thresholds:
-            r_ = float(recall_by_distance.get(t, 0.0))
-            logger.info("  dist<=%.4f -> Recall:%.3f", t, r_)
-            metrics[f"keypoints/recall@dist{t}"] = r_
+        # ------------------------------------------------------------
+        # Build crop size list
+        # ------------------------------------------------------------
+        def get_crop_size(result):
+            crop_bbox = result.get('crop_bbox', None)
+            if crop_bbox is not None:
+                x1, y1, x2, y2 = crop_bbox
+                crop_w = int(x2 - x1)
+                crop_h = int(y2 - y1)
+                return f"{crop_w}x{crop_h}"
+            else:
+                return f"{result['img_width']}x{result['img_height']}"
+
+        crop_size_array = np.array([get_crop_size(result) for result in results], dtype=object)
+        unique_crop_sizes = np.unique(crop_size_array)
+
+        # ------------------------------------------------------------
+        # Collect all unique labels globally
+        # ------------------------------------------------------------
+        all_labels_per_image = [set(np.unique(labels)) for labels in gt_labels_list]
+        unique_labels_all = sorted(set().union(*all_labels_per_image))
+
+        # Convert lists to numpy arrays once
+        gt_coords_array = np.array(gt_coords_list, dtype=object)
+        gt_labels_array = np.array(gt_labels_list, dtype=object)
+        pred_coords_array = np.array(pred_coords_list, dtype=object)
+        pred_labels_array = np.array(pred_labels_list, dtype=object)
+        pred_scores_array = np.array(pred_scores_list, dtype=object)
+        max_dim_array = np.array(max_dim_list)
+        distances_array = np.array(distances_list, dtype=object)
+
+        # ------------------------------------------------------------
+        # Sort thresholds for display
+        # ------------------------------------------------------------
+        sorted_dist_thresholds = sorted(self.distance_thresholds, reverse=True)
+        sorted_dist_indices = [self.distance_thresholds.index(t) for t in sorted_dist_thresholds]
+
+        # ------------------------------------------------------------
+        # GLOBAL column widths (computed once)
+        # ------------------------------------------------------------
+        label_col_width = max(
+            max(len(str(l)) for l in unique_labels_all),
+            len("Label"),
+            10
+        )
+
+        dist_headers = [f"{t:.4f}" for t in sorted_dist_thresholds]
+        col_widths = [max(len(h), 7) for h in dist_headers]
+
+        def crop_area(crop_size_str):
+            w, h = crop_size_str.split("x")
+            return int(w) * int(h)
+
+        # Sort crop sizes by area descending
+        sorted_crop_sizes = sorted(
+            unique_crop_sizes,
+            key=crop_area,
+            reverse=True
+        )
+
+        for crop_size in sorted_crop_sizes:
+
+            crop_mask = crop_size_array == crop_size
+            crop_indices = np.where(crop_mask)[0]
+
+            logger.info("  Crop size: %s", crop_size)
+
+            crop_gt_coords_array = gt_coords_array[crop_indices]
+            crop_gt_labels_array = gt_labels_array[crop_indices]
+            crop_pred_coords_array = pred_coords_array[crop_indices]
+            crop_pred_labels_array = pred_labels_array[crop_indices]
+            crop_pred_scores_array = pred_scores_array[crop_indices]
+            crop_max_dim_array = max_dim_array[crop_indices]
+            crop_distances_array = distances_array[crop_indices]
+
+            # ---- Header (same width for every crop) ----
+            header = (
+                "Label".ljust(label_col_width)
+                + " | "
+                + " | ".join([h.rjust(w) for h, w in zip(dist_headers, col_widths)])
+            )
+            logger.info("    %s", header)
+
+            separator = (
+                "-" * label_col_width
+                + "-+-"
+                + "-+-".join(["-" * w for w in col_widths])
+            )
+            logger.info("    %s", separator)
+
+            # ---- Rows ----
+            for label in unique_labels_all:
+
+                label_mask = np.array([label in np.unique(labels) for labels in crop_gt_labels_array])
+                if not np.any(label_mask):
+                    continue
+
+                label_local_indices = np.where(label_mask)[0]
+
+                label_gt_coords = crop_gt_coords_array[label_local_indices]
+                label_gt_labels = crop_gt_labels_array[label_local_indices]
+                label_pred_coords = crop_pred_coords_array[label_local_indices]
+                label_pred_labels = crop_pred_labels_array[label_local_indices]
+                label_pred_scores = crop_pred_scores_array[label_local_indices]
+                label_max_dim = crop_max_dim_array[label_local_indices]
+                label_distances = crop_distances_array[label_local_indices]
+
+                label_recalls = compute_recall(
+                    gt_coords_list=label_gt_coords,
+                    gt_labels_list=label_gt_labels,
+                    pred_coords_list=label_pred_coords,
+                    pred_labels_list=label_pred_labels,
+                    pred_scores_list=label_pred_scores,
+                    max_dim_list=label_max_dim,
+                    distance_threshold_norm=self.distance_thresholds,
+                    score_threshold=self.keypoint_score_threshold,
+                    distances_list=label_distances,
+                )
+
+                label_recalls = np.asarray(label_recalls, dtype=float)
+
+                recall_values = [f"{label_recalls[i]:.3f}" for i in sorted_dist_indices]
+                recall_str = " | ".join(
+                    [v.rjust(w) for v, w in zip(recall_values, col_widths)]
+                )
+
+                logger.info(
+                    "    %s | %s",
+                    str(label).ljust(label_col_width),
+                    recall_str
+                )
+
+                # Store metrics
+                for j, t in enumerate(self.distance_thresholds):
+                    metrics[
+                        f"keypoints/recall@dist{t}_crop{crop_size}_label{label}"
+                    ] = float(label_recalls[j])
+
+            logger.info("")
+
         logger.info("")
+
+
 
         # 3) Relation PR/F1 vs relation score thresholds at same fixed keypoint score and distance
         # Filter out images without relations or predictions
