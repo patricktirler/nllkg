@@ -15,7 +15,7 @@ import matplotlib.patches as mpatches
 from nllkp.datasets.keypointgraph_dataset import generate_crop_coordinates
 from nllkp.tools.inference import predinstances2dict, OpenVocPoseInferencer
 from nllkp.tools.graph_grouping import group_keypoints_into_instances, InstanceGroup, CheckMergeFn
-from nllkp.tools.graph_fitting import ShapeTemplate, fit_shapes_with_keypoints
+from nllkp.tools.graph_fitting import ShapeTemplate, fit_shapes
 
 
 
@@ -364,11 +364,9 @@ def group_keypoints_multicrop(
 
     return groups_per_crop
 
-
 def fit_shapes_multicrop(
     inference_json_path: str,
     templates: List[ShapeTemplate],
-    dof: str = "trsxsy",
     crop_size_key: str | None = None,
     keypoint_score_threshold: float = 0.3,
     sigma: float = 10.0,
@@ -381,8 +379,7 @@ def fit_shapes_multicrop(
     - Loads crop-based keypoint predictions from a per-image JSON file
     - Selects a crop size (smallest by default)
     - Aggregates keypoints across all crops of that size
-    - Fits the provided shape templates to the observed keypoints using
-      a parametric transformation model
+    - Fits the provided shape templates
 
     Parameters
     ----------
@@ -390,13 +387,6 @@ def fit_shapes_multicrop(
         Path to the per-image inference JSON file.
     templates : List[ShapeTemplate]
         List of initial shape templates to be refined.
-    dof : str, default="trs"
-        Degrees of freedom for template fitting:
-        - "t": translation only
-        - "tr": translation + rotation
-        - "trs": translation + rotation + uniform scale
-        - "trsxsy": translation + rotation + independent x/y scale
-        - "perspective": affine / projective transform
     crop_size_key : str, optional
         Crop size identifier to use (e.g., "1024x1024").
         If None, the smallest available crop size is used.
@@ -410,65 +400,36 @@ def fit_shapes_multicrop(
     List[ShapeTemplate]
         List of refined shape templates after alignment to detected keypoints.
     """
-
-    # Load inference JSON
     with open(inference_json_path, "r") as f:
         data = json.load(f)
 
     crop_results_by_size = data["crop_results_by_size"]
 
-    # Select crop size (default: smallest by area)
     if crop_size_key is None:
-        def crop_area(k):
-            w, h = map(int, k.split("x"))
-            return w * h
-
-        crop_size_key = min(crop_results_by_size.keys(), key=crop_area)
-
-    if crop_size_key not in crop_results_by_size:
-        raise KeyError(
-            f"Crop size '{crop_size_key}' not found in inference results. "
-            f"Available sizes: {list(crop_results_by_size.keys())}"
-        )
+        crop_size_key = min(crop_results_by_size.keys(), key=lambda k: eval(k.replace('x', '*')))
     
     crop_results = crop_results_by_size[crop_size_key]
 
-    # Aggregate keypoints across all crops
-    all_coords = []
-    all_scores = []
-    all_label_names = []
-
+    all_coords, all_scores, all_labels = [], [], []
     for c in crop_results:
         coords = np.asarray(c.get("keypoint_coords", []))
-        scores = np.asarray(c.get("keypoint_scores", []))
-        label_names = [l.strip() for l in c.get("keypoint_label_names", [])]
-
-        if len(coords) == 0:
-            continue
-
+        if len(coords) == 0: continue
         all_coords.append(coords)
-        all_scores.append(scores)
-        all_label_names.extend(label_names)
+        all_scores.append(np.asarray(c.get("keypoint_scores", [])))
+        all_labels.extend([l.strip() for l in c.get("keypoint_label_names", [])])
 
     if not all_coords:
         return []
 
-    kp_coords = np.concatenate(all_coords, axis=0)
-    kp_scores = np.concatenate(all_scores, axis=0)
-    kp_label_names = np.asarray(all_label_names)
-
-    # Refine templates using keypoint-based fitting
-    refined_templates = fit_shapes_with_keypoints(
-        keypoint_scores=kp_scores,
-        keypoint_coords=kp_coords,
-        keypoint_label_names=kp_label_names,
-        template_keypoints=templates,
-        dof=dof,
-        keypoint_score_threshold=keypoint_score_threshold,
+    return fit_shapes(
+        keypoint_scores=np.concatenate(all_scores),
+        keypoint_coords=np.concatenate(all_coords),
+        keypoint_label_names=np.asarray(all_labels),
+        templates=templates,
         sigma=sigma,
+        keypoint_score_threshold=keypoint_score_threshold
     )
 
-    return refined_templates
 
 def visualize_multicrop(
     img_path: str,
