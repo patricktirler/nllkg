@@ -140,35 +140,63 @@ def _dof_defaults(dof_list: List[str]) -> np.ndarray:
 
 
 def _params_to_matrix(params: np.ndarray, dof: str) -> np.ndarray:
-    """Convert parameters to 2x3 transformation matrix."""
+    """
+    Convert parameters to 2x3 transformation matrix.
+    
+    Ensures that:
+    - 'trs' = translation + rotation + uniform scale (no shear)
+    - 'trsxsy' = translation + rotation + anisotropic scale (no shear)
+    - 'perspective' = full 2x3 affine
+    """
     dof_list = _parse_dof(dof)
     param_dict = dict(zip(dof_list, params))
-    
+
+    # -------------------------
+    # Full affine (can shear)
+    # -------------------------
     if dof == "perspective":
-        # Direct 2x3 affine: [a, b, c, d, tx, ty]
         a = param_dict.get("a", 1.0)
         b = param_dict.get("b", 0.0)
         c = param_dict.get("c", 0.0)
         d = param_dict.get("d", 1.0)
         tx = param_dict.get("tx", 0.0)
         ty = param_dict.get("ty", 0.0)
-        return np.array([[a, b, tx], [c, d, ty]])
-    
-    # Compose from basic transforms
+        return np.array([
+            [a, b, tx],
+            [c, d, ty],
+        ])
+
+    # -------------------------
+    # Extract common params
+    # -------------------------
     tx = param_dict.get("tx", 0.0)
     ty = param_dict.get("ty", 0.0)
     theta = param_dict.get("theta", 0.0)
-    
+
+    c = np.cos(theta)
+    s = np.sin(theta)
+
+    # -------------------------
     # Determine scale
+    # -------------------------
     if "s" in param_dict:
+        # Uniform scale
         sx = sy = param_dict["s"]
     else:
+        # Anisotropic scale
         sx = param_dict.get("sx", 1.0)
         sy = param_dict.get("sy", 1.0)
-    
-    # Scale + Rotate + Translate
-    c, s = np.cos(theta), np.sin(theta)
+
+    # -------------------------
+    # Compose: A = R @ S
+    # -------------------------
+
+    A11 = c * sx
+    A12 = -s * sy
+    A21 = s * sx
+    A22 = c * sy
+
     return np.array([
-        [sx * c, -sy * s, tx],
-        [sx * s,  sy * c, ty],
+        [A11, A12, tx],
+        [A21, A22, ty],
     ])

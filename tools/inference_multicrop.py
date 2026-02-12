@@ -9,6 +9,8 @@ import shutil
 from mmengine.config import Config
 import matplotlib.pyplot as plt
 from matplotlib import cm
+import matplotlib.patches as mpatches
+
 
 from nllkp.datasets.keypointgraph_dataset import generate_crop_coordinates
 from nllkp.tools.inference import predinstances2dict, OpenVocPoseInferencer
@@ -468,8 +470,6 @@ def fit_shapes_multicrop(
 
     return refined_templates
 
-
-
 def visualize_multicrop(
     img_path: str,
     inference_json_path: str,
@@ -480,22 +480,21 @@ def visualize_multicrop(
     keypoint_score_threshold: float = 0.3,
     relation_score_threshold: float = 0.1,
 ) -> None:
-    """
-    Visualize full shape fitting pipeline in 3 subplots using a single JSON per image.
-    Each keypoint label is colored consistently across subplots.
-    """
+
     os.makedirs(save_dir, exist_ok=True)
 
-    # ------------------------------------------------------------------
-    # Load base image
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------
+    # Load image
+    # ------------------------------------------------------------
     img_bgr = cv2.imread(img_path)
     if img_bgr is None:
         raise FileNotFoundError(f"Could not load image: {img_path}")
 
-    # ------------------------------------------------------------------
+    H, W = img_bgr.shape[:2]
+
+    # ------------------------------------------------------------
     # Load inference JSON
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------
     with open(inference_json_path, "r") as f:
         data = json.load(f)
 
@@ -503,49 +502,70 @@ def visualize_multicrop(
     if not crop_sizes:
         raise ValueError(f"No crop results found in {inference_json_path}")
 
-    def crop_area(k):  # calculate crop area
+    def crop_area(k):
         w, h = map(int, k.split("x"))
         return w * h
 
     largest_key = max(crop_sizes.keys(), key=crop_area)
-    largest_crop_results = crop_sizes[largest_key]
-
     smallest_key = min(crop_sizes.keys(), key=crop_area)
+
+    largest_crop_results = crop_sizes[largest_key]
     smallest_crop_results = crop_sizes[smallest_key]
+
+    # ------------------------------------------------------------
+    # Collect all label names for consistent coloring
+    # ------------------------------------------------------------
+    all_labels = set()
+
+    for crop_list in [largest_crop_results, smallest_crop_results]:
+        for crop in crop_list:
+            all_labels.update(crop.get("keypoint_label_names", []))
+
+    for crop_groups in instance_groups:
+        for group in crop_groups:
+            labels = getattr(group, "keypoint_label_names", None)
+            if labels is not None:
+                all_labels.update(labels)
+
+    for template in fits + initial_guesses:
+        if template.keypoint_label_names is not None:
+            all_labels.update(template.keypoint_label_names)
+
+    all_labels = sorted(list(all_labels))
+    label_to_color = _get_label_colors(all_labels)
+
+    # Convert BGR to RGB for legend
+    label_to_rgb = {
+        k: tuple(reversed(v)) for k, v in label_to_color.items()
+    }
 
     REL_COLORS = [
         (255, 0, 0), (0, 255, 0), (0, 0, 255),
         (255, 255, 0), (255, 0, 255), (0, 255, 255)
     ]
 
-    # ------------------------------------------------------------------
-    # Create consistent colors per keypoint label
-    # ------------------------------------------------------------------
-    all_labels = set()
-    for crop_list in [largest_crop_results, smallest_crop_results]:
-        for crop in crop_list:
-            all_labels.update(crop.get("keypoint_labels", []))
-    for crop_groups in instance_groups:
-        for group in crop_groups:
-            if group.keypoint_labels is not None:
-                all_labels.update(group.keypoint_labels)
-    label_to_color = _get_label_colors(list(all_labels))
-
-    # ------------------------------------------------------------------
-    # Subplot 1: Largest crop size inference
-    # ------------------------------------------------------------------
+    # ============================================================
+    # 1️⃣ Largest crop inference
+    # ============================================================
     vis_crops = img_bgr.copy()
-    bboxes = [tuple(map(int, crop["crop_bbox"])) for crop in largest_crop_results if "crop_bbox" in crop]
+
+    # Draw crop boxes
+    bboxes = [
+        tuple(map(int, crop["crop_bbox"]))
+        for crop in largest_crop_results
+        if "crop_bbox" in crop
+    ]
     if bboxes:
         vis_crops = _draw_crops_with_borders(vis_crops, bboxes)
 
     for crop in largest_crop_results:
         kp_coords = np.asarray(crop.get("keypoint_coords", []))
         kp_scores = np.asarray(crop.get("keypoint_scores", []))
-        kp_label_names = crop.get("keypoint_label_names", [])
+        kp_labels = crop.get("keypoint_label_names", [])
+
         keep = kp_scores >= keypoint_score_threshold
         kp_coords = kp_coords[keep]
-        kp_label_names = [kp_label_names[i] for i, k in enumerate(keep) if k]
+        kp_labels = [kp_labels[i] for i, k in enumerate(keep) if k]
 
         if len(kp_coords) == 0:
             continue
@@ -559,88 +579,132 @@ def visualize_multicrop(
                     p1 = tuple(kp_coords[i].astype(int))
                     p2 = tuple(kp_coords[j].astype(int))
                     for r in range(R):
-                        score = relations[i, j, r]
-                        if score >= relation_score_threshold:
-                            color = REL_COLORS[r % len(REL_COLORS)]
-                            cv2.line(vis_crops, p1, p2, color, int(0.5 + 2 * score))
+                        if relations[i, j, r] >= relation_score_threshold:
+                            cv2.line(
+                                vis_crops,
+                                p1, p2,
+                                REL_COLORS[r % len(REL_COLORS)],
+                                2
+                            )
 
-        vis_crops = _draw_keypoints_cv2(vis_crops, kp_coords, kp_label_names, label_to_color)
+        vis_crops = _draw_keypoints_cv2(
+            vis_crops, kp_coords, kp_labels, label_to_color
+        )
 
-    # ------------------------------------------------------------------
-    # Subplot 2: Instance groups + initial shapes
-    # ------------------------------------------------------------------
+    # ============================================================
+    # 2️⃣ Instance groups + initial guesses
+    # ============================================================
     vis_groups = img_bgr.copy()
+    if bboxes:
+        vis_groups = _draw_crops_with_borders(vis_groups, bboxes)
+
     for crop_groups in instance_groups:
         for group in crop_groups:
             coords = np.asarray(group.keypoint_coords)
-            labels = group.keypoint_labels if group.keypoint_labels is not None else [None] * len(coords)
-            adj = group.adjacency_matrix  # (K, K, R)
-            if coords is None or coords.shape[0] == 0:
+            labels = getattr(group, "keypoint_label_names", None)
+
+            if coords is None or len(coords) == 0:
                 continue
 
+            if labels is None:
+                labels = [None] * len(coords)
+
             # Draw connections from adjacency matrix
-            K, _, R = adj.shape
+            K, _, R = group.adjacency_matrix.shape
             for i in range(K):
                 for j in range(i + 1, K):
                     p1 = tuple(coords[i].astype(int))
                     p2 = tuple(coords[j].astype(int))
                     for r in range(R):
-                        score = adj[i, j, r]
+                        score = group.adjacency_matrix[i, j, r]
                         if score >= relation_score_threshold:
                             color = REL_COLORS[r % len(REL_COLORS)]
                             cv2.line(vis_groups, p1, p2, color, int(0.5 + 2 * score))
 
-            vis_groups = _draw_keypoints_cv2(vis_groups, coords, labels, label_to_color)
+            vis_groups = _draw_keypoints_cv2(
+                vis_groups, coords, labels, label_to_color
+            )
 
     for template in initial_guesses:
         _draw_shape_template(vis_groups, template, color=(0, 255, 255))
 
-    # ------------------------------------------------------------------
-    # Subplot 3: Smallest crop size keypoints + crop boxes + fitted shapes
-    # ------------------------------------------------------------------
+    # ============================================================
+    # 3️⃣ Smallest crop + fitted shapes
+    # ============================================================
     vis_fits = img_bgr.copy()
-    small_bboxes = [tuple(map(int, crop["crop_bbox"])) for crop in smallest_crop_results if "crop_bbox" in crop]
+
+    small_bboxes = [
+        tuple(map(int, crop["crop_bbox"]))
+        for crop in smallest_crop_results
+        if "crop_bbox" in crop
+    ]
     if small_bboxes:
         vis_fits = _draw_crops_with_borders(vis_fits, small_bboxes)
 
     for crop in smallest_crop_results:
         kp_coords = np.asarray(crop.get("keypoint_coords", []))
         kp_scores = np.asarray(crop.get("keypoint_scores", []))
-        kp_label_names = crop.get("keypoint_label_names", [])
+        kp_labels = crop.get("keypoint_label_names", [])
+
         keep = kp_scores >= keypoint_score_threshold
         kp_coords = kp_coords[keep]
-        kp_label_names = [kp_label_names[i] for i, k in enumerate(keep) if k]
+        kp_labels = [kp_labels[i] for i, k in enumerate(keep) if k]
+
         if len(kp_coords) > 0:
-            vis_fits = _draw_keypoints_cv2(vis_fits, kp_coords, kp_label_names, label_to_color)
+            vis_fits = _draw_keypoints_cv2(
+                vis_fits, kp_coords, kp_labels, label_to_color
+            )
 
     for template in fits:
         _draw_shape_template(vis_fits, template, color=(255, 0, 0))
 
-    # ------------------------------------------------------------------
-    # Plot and save
-    # ------------------------------------------------------------------
-    fig, axs = plt.subplots(3, 1, figsize=(12, 16))
+    # ============================================================
+    # Dynamic figure size based on image resolution
+    # ============================================================
+    fig, axs = plt.subplots(3, 1, figsize=(20, 20))
+
     axs[0].imshow(cv2.cvtColor(vis_crops, cv2.COLOR_BGR2RGB))
     axs[0].set_title(f"1. Largest Crop Inference ({largest_key})")
     axs[0].axis("off")
 
     axs[1].imshow(cv2.cvtColor(vis_groups, cv2.COLOR_BGR2RGB))
-    axs[1].set_title("2. Instance Groups + Initial Shape Guesses")
+    axs[1].set_title("2. Instance Groups + Initial Guesses")
     axs[1].axis("off")
 
     axs[2].imshow(cv2.cvtColor(vis_fits, cv2.COLOR_BGR2RGB))
-    axs[2].set_title(f"3. Smallest Crop Keypoints + Fitted Shapes ({smallest_key})")
+    axs[2].set_title(f"3. Fitted Shapes ({smallest_key})")
     axs[2].axis("off")
 
+    # ------------------------------------------------------------
+    # Legend (first subplot)
+    # ------------------------------------------------------------
+
+    legend_handles = [
+        mpatches.Patch(
+            color=np.array(label_to_rgb[label]) / 255.0,
+            label=label
+        )
+        for label in all_labels
+    ]
+
+    axs[0].legend(
+        handles=legend_handles,
+        loc="upper right",
+        fontsize=8,
+        framealpha=0.9,
+        ncol=1
+    )
+
     plt.tight_layout()
+
     out_path = os.path.join(save_dir, os.path.basename(img_path))
-    plt.savefig(out_path, dpi=400)
+    plt.savefig(out_path, dpi=500, bbox_inches="tight")
     plt.close(fig)
 
 
 def _get_label_colors(labels: List[str]) -> dict:
     n = len(labels)
-    colormap = cm.get_cmap("tab20", n)
+    colormap = cm.get_cmap("rainbow", n)
     label_to_color = {}
     for i, label in enumerate(labels):
         rgb = colormap(i)[:3]  # float RGB [0,1]
@@ -652,7 +716,7 @@ def _get_label_colors(labels: List[str]) -> dict:
 def _draw_keypoints_cv2(img: np.ndarray, k_coords: np.ndarray,
                        k_labels: List[str],
                        label_to_color: dict,
-                       radius: int = 4) -> np.ndarray:
+                       radius: int = 5) -> np.ndarray:
     vis = img.copy()
     for coord, label in zip(k_coords, k_labels):
         color = label_to_color.get(label, (0, 255, 0))
@@ -674,10 +738,59 @@ def _draw_shape_template(img: np.ndarray, template, color=(0, 255, 255)) -> None
         cv2.circle(img, tuple(pt), 2, (255, 255, 255), 1)
 
 
-def _draw_crops_with_borders(img: np.ndarray, crops: List[Tuple[int, int, int, int]],
-                                 color: Tuple[int, int, int] = (200, 200, 200),
-                                 thickness: int = 2) -> np.ndarray:
+def _draw_crops_with_borders(
+    img: np.ndarray,
+    crops: List[Tuple[int, int, int, int]],
+    color: Tuple[int, int, int] = (200, 200, 200),
+    thickness: int = 2,
+    corner_length_ratio: float = 0.04,
+    corner_thickness: int = 8,
+) -> np.ndarray:
+    """
+    Draw crop rectangles with thick L-shaped corner markers.
+
+    Parameters
+    ----------
+    img : np.ndarray
+        Image in BGR format.
+    crops : list of (x1, y1, x2, y2)
+        Crop bounding boxes.
+    color : tuple
+        BGR color.
+    thickness : int
+        Border thickness.
+    corner_length_ratio : float
+        Length of corner markers as fraction of box size.
+    corner_thickness : int
+        Thickness of corner marker lines.
+    """
+
     vis = img.copy()
+
     for x1, y1, x2, y2 in crops:
+        # Draw main rectangle
         cv2.rectangle(vis, (x1, y1), (x2, y2), color, thickness)
+
+        w = x2 - x1
+        h = y2 - y1
+
+        # Corner marker length proportional to size
+        cl = int(min(w, h) * corner_length_ratio)
+
+        # Top-left corner
+        cv2.line(vis, (x1, y1), (x1 + cl, y1), color, corner_thickness)
+        cv2.line(vis, (x1, y1), (x1, y1 + cl), color, corner_thickness)
+
+        # Top-right corner
+        cv2.line(vis, (x2, y1), (x2 - cl, y1), color, corner_thickness)
+        cv2.line(vis, (x2, y1), (x2, y1 + cl), color, corner_thickness)
+
+        # Bottom-left corner
+        cv2.line(vis, (x1, y2), (x1 + cl, y2), color, corner_thickness)
+        cv2.line(vis, (x1, y2), (x1, y2 - cl), color, corner_thickness)
+
+        # Bottom-right corner
+        cv2.line(vis, (x2, y2), (x2 - cl, y2), color, corner_thickness)
+        cv2.line(vis, (x2, y2), (x2, y2 - cl), color, corner_thickness)
+
     return vis
