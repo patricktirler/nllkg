@@ -1,6 +1,6 @@
 import os
 import json
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Any
 
 import cv2
 import numpy as np
@@ -15,7 +15,7 @@ import matplotlib.patches as mpatches
 from nllkp.datasets.keypointgraph_dataset import generate_crop_coordinates
 from nllkp.tools.inference import predinstances2dict, OpenVocPoseInferencer
 from nllkp.tools.graph_grouping import group_keypoints_into_instances, InstanceGroup, CheckMergeFn
-from nllkp.tools.graph_fitting import ShapeTemplate, fit_shapes
+from nllkp.tools.graph_fitting import ShapeTemplate
 
 
 
@@ -370,6 +370,8 @@ def fit_shapes_multicrop(
     crop_size_key: str | None = None,
     keypoint_score_threshold: float = 0.3,
     sigma: float = 10.0,
+    method: str = "L-BFGS-B",
+    **minimize_kwargs: Any,
 ) -> List[ShapeTemplate]:
     """
     Refine general shape templates using detected keypoints
@@ -394,6 +396,10 @@ def fit_shapes_multicrop(
         Minimum keypoint confidence score to consider during fitting.
     sigma : float, default=10.0
         Gaussian bandwidth used in the fitting likelihood.
+    method : str, default="L-BFGS-B"
+        Optimization algorithm passed to `scipy.optimize.minimize`.
+    **minimize_kwargs : dict
+        Additional keyword arguments forwarded directly to `scipy.optimize.minimize`.
 
     Returns
     -------
@@ -420,15 +426,26 @@ def fit_shapes_multicrop(
 
     if not all_coords:
         return []
+    
+    keypoint_coords = np.concatenate(all_coords)
+    keypoint_scores = np.concatenate(all_scores)
+    keypoint_label_names = np.asarray(all_labels)
+    
+    mask = keypoint_scores >= keypoint_score_threshold
+    keypoint_coords, keypoint_scores, keypoint_label_names = keypoint_coords[mask], keypoint_scores[mask], keypoint_label_names[mask]
 
-    return fit_shapes(
-        keypoint_scores=np.concatenate(all_scores),
-        keypoint_coords=np.concatenate(all_coords),
-        keypoint_label_names=np.asarray(all_labels),
-        templates=templates,
-        sigma=sigma,
-        keypoint_score_threshold=keypoint_score_threshold
-    )
+
+    return [
+        template.fit(
+            keypoint_coords=keypoint_coords,
+            keypoint_scores=keypoint_scores,
+            keypoint_label_names=keypoint_label_names,
+            sigma=sigma,
+            method=method,
+            **minimize_kwargs
+        ) 
+        for template in templates
+    ]
 
 
 def visualize_multicrop(
@@ -688,7 +705,7 @@ def _draw_keypoints_cv2(img: np.ndarray, k_coords: np.ndarray,
 
 
 def _draw_shape_template(img: np.ndarray, template, color=(0, 255, 255)) -> None:
-    coords = template.keypoint_coords
+    coords = template.get_coords_from_params(template.params)
     if len(coords) == 0:
         return
     pts = coords.astype(int)

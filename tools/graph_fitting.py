@@ -1,73 +1,116 @@
 import numpy as np
-from typing import List
+from typing import Any
 from scipy.optimize import minimize
 from abc import ABC, abstractmethod
+import copy
+
 
 class ShapeTemplate(ABC):
     """
-    Base class for shapes. 
-    Subclasses must define how to generate coordinates from a parameter vector.
+    Abstract base class representing a parametric geometric shape template.
     """
-    def __init__(self, label_names: np.ndarray):
+
+    def __init__(self, params: np.ndarray, label_names: np.ndarray):
+        """
+        Initialize a shape template.
+
+        Parameters
+        ----------
+        params : np.ndarray of shape (P,)
+            Parameter vector describing a specific geometric configuration.
+        label_names : np.ndarray of shape (M,)
+            Array of keypoint label identifiers associated with this template.
+            These must match the label space used by detected keypoints.
+        """
+        self.params = params
         self.keypoint_label_names = label_names
 
-    @abstractmethod
-    def get_params(self) -> np.ndarray:
-        """Serialize current geometric state to a numpy array."""
-        pass
-
-    @abstractmethod
-    def from_params(self, params: np.ndarray) -> 'ShapeTemplate':
-        """Create a new instance of this shape from a parameter array."""
-        pass
 
     @abstractmethod
     def get_coords_from_params(self, params: np.ndarray) -> np.ndarray:
-        """Calculate keypoint coordinates for a given set of parameters."""
+        """
+        Compute keypoint coordinates from a parameter vector.
+
+        Parameters
+        ----------
+        params : np.ndarray of shape (P,)
+            Parameter vector describing a geometric configuration.
+
+        Returns
+        -------
+        np.ndarray of shape (M, 2)
+            2D coordinates of all template keypoints.
+            M is the number of template keypoints.
+        """
         pass
 
-    @property
-    def keypoint_coords(self) -> np.ndarray:
-        """Current coordinates based on internal state."""
-        return self.get_coords_from_params(self.get_params())
 
+    def fit(
+        self,
+        keypoint_coords: np.ndarray,
+        keypoint_scores: np.ndarray,
+        keypoint_label_names: np.ndarray,
+        sigma: float = 10.0,
+        method: str = "L-BFGS-B",
+        **minimize_kwargs: Any,
+    ) -> "ShapeTemplate":
+        """
+        Fit this template to observed keypoints using soft Gaussian matching.
 
+        Parameters
+        ----------
+        keypoint_coords : np.ndarray of shape (N, 2)
+            Observed 2D keypoint coordinates.
 
-def fit_shapes(
-    templates: List[ShapeTemplate],
-    keypoint_coords: np.ndarray,
-    keypoint_scores: np.ndarray,
-    keypoint_label_names: np.ndarray,
-    sigma: float = 10.0,
-    keypoint_score_threshold: float = 0.3
-) -> List[ShapeTemplate]:
-    """
-    Fits provided shape objects to observed keypoints.
-    """
-    # Filter noise
-    mask = keypoint_scores >= keypoint_score_threshold
-    obs_c, obs_s, obs_l = keypoint_coords[mask], keypoint_scores[mask], keypoint_label_names[mask]
+        keypoint_scores : np.ndarray of shape (N,)
+            Confidence scores for each observed keypoint.
+            Used as weights in the likelihood computation.
 
-    refined_results = []
+        keypoint_label_names : np.ndarray of shape (N,)
+            Label identifiers for observed keypoints.
+            Must be comparable with `self.keypoint_label_names`.
 
-    for template in templates:
-        initial_params = template.get_params()
-        # Pre-compute label matches for this template
-        label_mask = template.keypoint_label_names[:, np.newaxis] == obs_l[np.newaxis, :]
+        sigma : float, default=10.0
+            Standard deviation of the Gaussian kernel controlling spatial tolerance.
 
-        def objective(params):
-            coords = template.get_coords_from_params(params)
-            
-            # Distance squared (M, N)
-            diff = coords[:, np.newaxis, :] - obs_c[np.newaxis, :, :]
+        method : str, default="L-BFGS-B"
+            Optimization algorithm passed to `scipy.optimize.minimize`.
+
+        **minimize_kwargs : dict
+            Additional keyword arguments forwarded directly to `scipy.optimize.minimize`.
+
+        Returns
+        -------
+        ShapeTemplate
+            A new shape instance with optimized parameters.
+        """
+
+        initial_params = self.params
+
+        # Precompute label matching mask (M template × N observed)
+        label_mask = (
+            self.keypoint_label_names[:, np.newaxis]
+            == keypoint_label_names[np.newaxis, :]
+        )
+
+        def objective(params: np.ndarray) -> float:
+            coords = self.get_coords_from_params(params)
+
+            # Pairwise squared distances (M, N)
+            diff = coords[:, np.newaxis, :] - keypoint_coords[np.newaxis, :, :]
             dist_sq = np.sum(diff**2, axis=-1)
-            
-            # Soft-matching Gaussian likelihood
-            likelihoods = obs_s * np.exp(-dist_sq / (2 * sigma**2))
+
+            likelihoods = keypoint_scores * np.exp(-dist_sq / (2 * sigma**2))
+
             return -np.sum(likelihoods * label_mask)
 
-        
-        res = minimize(objective, initial_params, method="L-BFGS-B")
-        refined_results.append(template.from_params(res.x))
+        result = minimize(
+            objective,
+            initial_params,
+            method=method,
+            **minimize_kwargs,
+        )
 
-    return refined_results
+        new_instance = copy.deepcopy(self)
+        new_instance.params = result.x
+        return new_instance
