@@ -59,7 +59,7 @@ class KeypointRelationMetric(BaseMetric):
             # Handle cropped images
             crop_bbox = data_sample.get('crop_bbox', None)
             gt_coords = data_sample['gt_instances']['keypoint_coords'].cpu().numpy().reshape(-1, 2)
-            gt_labels = np.array([data_sample['text'][label] for label in data_sample['gt_instances']['labels']])
+            gt_label_names = np.array([data_sample['text'][label] for label in data_sample['gt_instances']['labels']])
             gt_relations = data_sample['gt_instances']['relation_matrices'].cpu().numpy()
             pred_coords = pred['keypoints'].cpu().numpy().reshape(-1, 2)
             
@@ -73,7 +73,7 @@ class KeypointRelationMetric(BaseMetric):
                     (gt_coords[:, 1] >= y1) & (gt_coords[:, 1] < y2)
                 )
                 gt_coords = gt_coords[gt_mask]
-                gt_labels = gt_labels[gt_mask]
+                gt_label_names = gt_label_names[gt_mask]
                 
                 # Filter relation matrices
                 gt_relations = gt_relations[gt_mask][:, gt_mask, :]
@@ -89,11 +89,11 @@ class KeypointRelationMetric(BaseMetric):
                 img_height=img_h,
                 max_dim=max_dim,
                 gt_coords=gt_coords,
-                gt_labels=gt_labels,
+                gt_label_names=gt_label_names,
                 gt_relations=gt_relations,
                 relation_names=data_sample.get('relation_text', []),
                 pred_coords=pred_coords,
-                pred_labels=np.array(pred['label_names']),
+                pred_label_names=np.array(pred['label_names']),
                 pred_scores=pred['scores'].cpu().numpy(),
                 pred_relations=pred['relation_scores'].cpu().numpy(),
                 crop_bbox=crop_bbox,
@@ -117,7 +117,7 @@ class KeypointRelationMetric(BaseMetric):
                     'img_path': record['img_path'],
                     'img_width': record['img_width'],
                     'img_height': record['img_height'],
-                    'keypoint_label_names': record['gt_labels'].tolist(),
+                    'keypoint_label_names': record['gt_label_names'].tolist(),
                     'keypoint_coords': record['gt_coords'].tolist(),
                     'relation_matrices': record['gt_relations'].tolist() if record['gt_relations'] is not None else None,
                     'relation_names': record['relation_names'],
@@ -134,9 +134,9 @@ class KeypointRelationMetric(BaseMetric):
 
         # Pack lists
         gt_coords_list = [r['gt_coords'] for r in results]
-        gt_labels_list = [r['gt_labels'] for r in results]
+        gt_label_names_list = [r['gt_label_names'] for r in results]
         pred_coords_list = [r['pred_coords'] for r in results]
-        pred_labels_list = [r['pred_labels'] for r in results]
+        pred_label_names_list = [r['pred_label_names'] for r in results]
         pred_scores_list = [r['pred_scores'] for r in results]
         max_dim_list = [r['max_dim'] for r in results]
 
@@ -155,9 +155,9 @@ class KeypointRelationMetric(BaseMetric):
         score_thr_vec = np.array(self.keypoint_score_thresholds, dtype=float)
         kp_prec = compute_precision(
             gt_coords_list=gt_coords_list,
-            gt_labels_list=gt_labels_list,
+            gt_labels_list=gt_label_names_list,
             pred_coords_list=pred_coords_list,
-            pred_labels_list=pred_labels_list,
+            pred_labels_list=pred_label_names_list,
             pred_scores_list=pred_scores_list,
             max_dim_list=max_dim_list,
             distance_threshold_norm=self.keypoint_distance_threshold,
@@ -166,9 +166,9 @@ class KeypointRelationMetric(BaseMetric):
         )
         kp_rec = compute_recall(
             gt_coords_list=gt_coords_list,
-            gt_labels_list=gt_labels_list,
+            gt_labels_list=gt_label_names_list,
             pred_coords_list=pred_coords_list,
-            pred_labels_list=pred_labels_list,
+            pred_labels_list=pred_label_names_list,
             pred_scores_list=pred_scores_list,
             max_dim_list=max_dim_list,
             distance_threshold_norm=self.keypoint_distance_threshold,
@@ -215,16 +215,16 @@ class KeypointRelationMetric(BaseMetric):
         unique_crop_sizes = np.unique(crop_size_array)
 
         # ------------------------------------------------------------
-        # Collect all unique labels globally
+        # Collect all unique label names globally
         # ------------------------------------------------------------
-        all_labels_per_image = [set(np.unique(labels)) for labels in gt_labels_list]
-        unique_labels_all = sorted(set().union(*all_labels_per_image))
+        all_label_names_per_image = [set(np.unique(label_names)) for label_names in gt_label_names_list]
+        unique_label_names_all = sorted(set().union(*all_label_names_per_image))
 
         # Convert lists to numpy arrays once
         gt_coords_array = np.array(gt_coords_list, dtype=object)
-        gt_labels_array = np.array(gt_labels_list, dtype=object)
+        gt_label_names_array = np.array(gt_label_names_list, dtype=object)
         pred_coords_array = np.array(pred_coords_list, dtype=object)
-        pred_labels_array = np.array(pred_labels_list, dtype=object)
+        pred_label_names_array = np.array(pred_label_names_list, dtype=object)
         pred_scores_array = np.array(pred_scores_list, dtype=object)
         max_dim_array = np.array(max_dim_list)
         distances_array = np.array(distances_list, dtype=object)
@@ -239,7 +239,7 @@ class KeypointRelationMetric(BaseMetric):
         # GLOBAL column widths (computed once)
         # ------------------------------------------------------------
         label_col_width = max(
-            max(len(str(l)) for l in unique_labels_all),
+            max(len(str(l)) for l in unique_label_names_all),
             len("Label"),
             10
         )
@@ -266,9 +266,9 @@ class KeypointRelationMetric(BaseMetric):
             logger.info("  Crop size: %s", crop_size)
 
             crop_gt_coords_array = gt_coords_array[crop_indices]
-            crop_gt_labels_array = gt_labels_array[crop_indices]
+            crop_gt_label_names_array = gt_label_names_array[crop_indices]
             crop_pred_coords_array = pred_coords_array[crop_indices]
-            crop_pred_labels_array = pred_labels_array[crop_indices]
+            crop_pred_label_names_array = pred_label_names_array[crop_indices]
             crop_pred_scores_array = pred_scores_array[crop_indices]
             crop_max_dim_array = max_dim_array[crop_indices]
             crop_distances_array = distances_array[crop_indices]
@@ -289,27 +289,38 @@ class KeypointRelationMetric(BaseMetric):
             logger.info("    %s", separator)
 
             # ---- Rows ----
-            for label in unique_labels_all:
+            for label_name in unique_label_names_all:
 
-                label_mask = np.array([label in np.unique(labels) for labels in crop_gt_labels_array])
+                label_mask = np.array([label_name in np.unique(label_names) for label_names in crop_gt_label_names_array])
                 if not np.any(label_mask):
                     continue
 
                 label_local_indices = np.where(label_mask)[0]
 
-                label_gt_coords = crop_gt_coords_array[label_local_indices]
-                label_gt_labels = crop_gt_labels_array[label_local_indices]
-                label_pred_coords = crop_pred_coords_array[label_local_indices]
-                label_pred_labels = crop_pred_labels_array[label_local_indices]
-                label_pred_scores = crop_pred_scores_array[label_local_indices]
-                label_max_dim = crop_max_dim_array[label_local_indices]
-                label_distances = crop_distances_array[label_local_indices]
+                # Filter GT coordinates and labels to only include the target label_name
+                label_gt_coords = []
+                label_gt_label_names = []
+                label_pred_coords = []
+                label_pred_label_names = []
+                label_pred_scores = []
+                label_max_dim = []
+                label_distances = []
+                
+                for idx in label_local_indices:
+                    mask = crop_gt_label_names_array[idx] == label_name
+                    label_gt_coords.append(crop_gt_coords_array[idx][mask])
+                    label_gt_label_names.append(crop_gt_label_names_array[idx][mask])
+                    label_pred_coords.append(crop_pred_coords_array[idx])
+                    label_pred_label_names.append(crop_pred_label_names_array[idx])
+                    label_pred_scores.append(crop_pred_scores_array[idx])
+                    label_max_dim.append(crop_max_dim_array[idx])
+                    label_distances.append(crop_distances_array[idx][mask])
 
                 label_recalls = compute_recall(
                     gt_coords_list=label_gt_coords,
-                    gt_labels_list=label_gt_labels,
+                    gt_labels_list=label_gt_label_names,
                     pred_coords_list=label_pred_coords,
-                    pred_labels_list=label_pred_labels,
+                    pred_labels_list=label_pred_label_names,
                     pred_scores_list=label_pred_scores,
                     max_dim_list=label_max_dim,
                     distance_threshold_norm=self.distance_thresholds,
@@ -326,32 +337,30 @@ class KeypointRelationMetric(BaseMetric):
 
                 logger.info(
                     "    %s | %s",
-                    str(label).ljust(label_col_width),
+                    str(label_name).ljust(label_col_width),
                     recall_str
                 )
 
                 # Store metrics
                 for j, t in enumerate(self.distance_thresholds):
                     metrics[
-                        f"keypoints/recall@dist{t}_crop{crop_size}_label{label}"
+                        f"keypoints/recall@dist{t}_crop{crop_size}_label{label_name}"
                     ] = float(label_recalls[j])
 
             logger.info("")
 
         logger.info("")
 
-
-
         # 3) Relation PR/F1 vs relation score thresholds at same fixed keypoint score and distance
         # Filter out images without relations or predictions
         if any(g is not None and p is not None for g, p in zip(gt_relations_list, pred_relations_list)):
             relation_curves = compute_precision_recall_relation(
                 gt_coords_list=gt_coords_list,
-                gt_labels_list=gt_labels_list,
+                gt_labels_list=gt_label_names_list,
                 gt_relations_list=gt_relations_list,
                 relation_names_list=relation_names_list,
                 pred_coords_list=pred_coords_list,
-                pred_labels_list=pred_labels_list,
+                pred_labels_list=pred_label_names_list,
                 pred_scores_list=pred_scores_list,
                 pred_relations_list=pred_relations_list,
                 max_dim_list=max_dim_list,
