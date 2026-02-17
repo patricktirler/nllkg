@@ -10,7 +10,7 @@ class ShapeTemplate(ABC):
     Abstract base class representing a parametric geometric shape template.
     """
 
-    def __init__(self, params: np.ndarray, label_names: np.ndarray):
+    def __init__(self, params: np.ndarray, keypoint_label_names: np.ndarray):
         """
         Initialize a shape template.
 
@@ -18,12 +18,12 @@ class ShapeTemplate(ABC):
         ----------
         params : np.ndarray of shape (P,)
             Parameter vector describing a specific geometric configuration.
-        label_names : np.ndarray of shape (M,)
+        keypoint_label_names : np.ndarray of shape (M,)
             Array of keypoint label identifiers associated with this template.
             These must match the label space used by detected keypoints.
         """
         self.params = params
-        self.keypoint_label_names = label_names
+        self.keypoint_label_names = keypoint_label_names
 
 
     @abstractmethod
