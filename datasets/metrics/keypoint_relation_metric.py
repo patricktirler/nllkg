@@ -341,12 +341,6 @@ class KeypointRelationMetric(BaseMetric):
                     recall_str
                 )
 
-                # Store metrics
-                for j, t in enumerate(self.distance_thresholds):
-                    metrics[
-                        f"keypoints/recall@dist{t}_crop{crop_size}_label{label_name}"
-                    ] = float(label_recalls[j])
-
             logger.info("")
 
         logger.info("")

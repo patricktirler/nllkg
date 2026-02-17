@@ -113,4 +113,5 @@ class ShapeTemplate(ABC):
 
         new_instance = copy.deepcopy(self)
         new_instance.params = result.x
+        new_instance.opt_result = result
         return new_instance

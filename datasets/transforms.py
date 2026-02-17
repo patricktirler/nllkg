@@ -206,6 +206,152 @@ class TransformKeypoints(BaseTransform):
 
         return results
     
+
+
+@TRANSFORMS.register_module()
+class TopDownBBoxCrop(BaseTransform):
+    """Crop image to crop_bbox.
+    """
+
+    def __init__(self, transform_keypoints: bool = False, **kwargs):
+        super().__init__(**kwargs)
+        self.transform_keypoints = transform_keypoints
+
+    @staticmethod
+    def _bbox_to_corners(crop_bbox):
+        """(x1,y1,x2,y2) -> (4,2) TL,TR,BR,BL"""
+        x1, y1, x2, y2 = crop_bbox
+        return np.array(
+            [[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
+            dtype=np.float32,
+        )
+
+    @staticmethod
+    def _apply_homography(points, H):
+        """Apply homography to Nx2 points"""
+        pts = np.concatenate(
+            [points, np.ones((points.shape[0], 1), dtype=np.float32)],
+            axis=1,
+        )
+        warped = (H @ pts.T).T
+        return warped[:, :2] / warped[:, 2:3]
+
+    @staticmethod
+    def _perspective_crop(img, corners):
+        """Perspective crop using warped crop_bbox corners"""
+        w1 = np.linalg.norm(corners[1] - corners[0])
+        w2 = np.linalg.norm(corners[2] - corners[3])
+        h1 = np.linalg.norm(corners[3] - corners[0])
+        h2 = np.linalg.norm(corners[2] - corners[1])
+
+        out_w = max(1, int(round(max(w1, w2))))
+        out_h = max(1, int(round(max(h1, h2))))
+
+        dst = np.array(
+            [[0, 0],
+             [out_w - 1, 0],
+             [out_w - 1, out_h - 1],
+             [0, out_h - 1]],
+            dtype=np.float32,
+        )
+
+        H_crop = cv2.getPerspectiveTransform(
+            corners.astype(np.float32), dst
+        )
+        crop = cv2.warpPerspective(img, H_crop, (out_w, out_h))
+        return crop, H_crop
+
+    @staticmethod
+    def _warp_and_aabb(bboxes, H):
+        """Warp bboxes by H and return axis-aligned boxes."""
+        warped_boxes = []
+        for b in bboxes:
+            corners = TopDownBBoxCrop._bbox_to_corners(b)
+            warped = TopDownBBoxCrop._apply_homography(corners, H)
+            x1, y1 = warped.min(axis=0)
+            x2, y2 = warped.max(axis=0)
+            warped_boxes.append([x1, y1, x2, y2])
+        return np.asarray(warped_boxes, dtype=np.float32)
+
+    def transform(self, results: dict) -> dict:
+        if 'crop_bbox' not in results or 'img' not in results:
+            return results
+
+        img = results['img']
+        crop_bbox = np.asarray(results['crop_bbox'], dtype=np.float32)
+
+        H_prev = results.get(
+            'homography_matrix', np.eye(3, dtype=np.float32)
+        )
+
+        # --- main crop_bbox crop ---
+        corners = self._bbox_to_corners(crop_bbox)
+        corners = self._apply_homography(corners, H_prev)
+
+        # recompute axis-aligned corners
+        x1, y1 = corners[:, 0].min(), corners[:, 1].min()
+        x2, y2 = corners[:, 0].max(), corners[:, 1].max()
+
+        # --- clip to image shape ---
+        h, w = results['img_shape']
+        x1 = np.clip(x1, 0, w - 1)
+        x2 = np.clip(x2, 0, w - 1)
+        y1 = np.clip(y1, 0, h - 1)
+        y2 = np.clip(y2, 0, h - 1)
+
+        corners = np.array([
+            [x1, y1],
+            [x2, y1],
+            [x2, y2],
+            [x1, y2]
+        ], dtype=np.float32)
+
+
+        crop, H_crop = self._perspective_crop(img, corners)
+
+        # compose homography
+        H_new = H_crop @ H_prev
+        results['homography_matrix'] = H_new
+
+        # --- update gt_bboxes ---
+        if 'gt_bboxes' in results:
+            gt = results['gt_bboxes']
+
+            if hasattr(gt, 'tensor'):  # BaseBoxes
+                b = gt.tensor.cpu().numpy()
+                b = self._warp_and_aabb(b, H_new)
+                b[:, [0, 2]] = np.clip(b[:, [0, 2]], 0, crop.shape[1])
+                b[:, [1, 3]] = np.clip(b[:, [1, 3]], 0, crop.shape[0])
+                gt.tensor = gt.tensor.new_tensor(b)
+
+            else:  # numpy
+                b = self._warp_and_aabb(gt, H_new)
+                b[:, [0, 2]] = np.clip(b[:, [0, 2]], 0, crop.shape[1])
+                b[:, [1, 3]] = np.clip(b[:, [1, 3]], 0, crop.shape[0])
+                results['gt_bboxes'] = b
+
+        # --- optionally update keypoints ---
+        if self.transform_keypoints and 'gt_keypoint_coords' in results:
+            kpts = results['gt_keypoint_coords']
+            # (N,1,2) or (N,2)
+            reshape_1d = False
+            if kpts.ndim == 3:
+                reshape_1d = True
+                kpts = kpts[:, 0, :]
+            kpts = self._apply_homography(kpts, H_new)
+            if reshape_1d:
+                kpts = kpts[:, None, :]
+            results['gt_keypoint_coords'] = kpts
+
+        # --- finalize ---
+        results['img'] = crop
+        results['img_shape'] = (crop.shape[0], crop.shape[1])
+
+        return results
+
+    def __repr__(self):
+        return f"{self.__class__.__name__}(transform_keypoints={self.transform_keypoints})"
+    
     
 @TRANSFORMS.register_module()
 class PackKeypointGraphInputs(PackDetInputs):
@@ -299,136 +445,4 @@ class PackKeypointGraphInputs(PackDetInputs):
         )
         
         return results
-
-
-@TRANSFORMS.register_module()
-class TopDownBBoxCrop(BaseTransform):
-    """Crop image tightly to crop_bbox using perspective warp.
-
-    - Computes 4 crop_bbox corners
-    - Applies existing homography
-    - Crops via perspective warp (rotation preserved)
-    - Updates gt_bboxes by warping their corners
-    - Optionally updates gt_keypoint_coords
-    - Composes homography correctly
-    """
-
-    def __init__(self, transform_keypoints: bool = False, **kwargs):
-        super().__init__(**kwargs)
-        self.transform_keypoints = transform_keypoints
-
-    @staticmethod
-    def _bbox_to_corners(crop_bbox):
-        """(x1,y1,x2,y2) -> (4,2) TL,TR,BR,BL"""
-        x1, y1, x2, y2 = crop_bbox
-        return np.array(
-            [[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
-            dtype=np.float32,
-        )
-
-    @staticmethod
-    def _apply_homography(points, H):
-        """Apply homography to Nx2 points"""
-        pts = np.concatenate(
-            [points, np.ones((points.shape[0], 1), dtype=np.float32)],
-            axis=1,
-        )
-        warped = (H @ pts.T).T
-        return warped[:, :2] / warped[:, 2:3]
-
-    @staticmethod
-    def _perspective_crop(img, corners):
-        """Perspective crop using warped crop_bbox corners"""
-        w1 = np.linalg.norm(corners[1] - corners[0])
-        w2 = np.linalg.norm(corners[2] - corners[3])
-        h1 = np.linalg.norm(corners[3] - corners[0])
-        h2 = np.linalg.norm(corners[2] - corners[1])
-
-        out_w = max(1, int(round(max(w1, w2))))
-        out_h = max(1, int(round(max(h1, h2))))
-
-        dst = np.array(
-            [[0, 0],
-             [out_w - 1, 0],
-             [out_w - 1, out_h - 1],
-             [0, out_h - 1]],
-            dtype=np.float32,
-        )
-
-        H_crop = cv2.getPerspectiveTransform(
-            corners.astype(np.float32), dst
-        )
-        crop = cv2.warpPerspective(img, H_crop, (out_w, out_h))
-        return crop, H_crop
-
-    @staticmethod
-    def _warp_and_aabb(bboxes, H):
-        """Warp bboxes by H and return axis-aligned boxes."""
-        warped_boxes = []
-        for b in bboxes:
-            corners = TopDownBBoxCrop._bbox_to_corners(b)
-            warped = TopDownBBoxCrop._apply_homography(corners, H)
-            x1, y1 = warped.min(axis=0)
-            x2, y2 = warped.max(axis=0)
-            warped_boxes.append([x1, y1, x2, y2])
-        return np.asarray(warped_boxes, dtype=np.float32)
-
-    def transform(self, results: dict) -> dict:
-        if 'crop_bbox' not in results or 'img' not in results:
-            return results
-
-        img = results['img']
-        crop_bbox = np.asarray(results['crop_bbox'], dtype=np.float32)
-
-        H_prev = results.get(
-            'homography_matrix', np.eye(3, dtype=np.float32)
-        )
-
-        # --- main crop_bbox crop ---
-        corners = self._bbox_to_corners(crop_bbox)
-        corners = self._apply_homography(corners, H_prev)
-        crop, H_crop = self._perspective_crop(img, corners)
-
-        # compose homography
-        H_new = H_crop @ H_prev
-        results['homography_matrix'] = H_new
-
-        # --- update gt_bboxes ---
-        if 'gt_bboxes' in results:
-            gt = results['gt_bboxes']
-
-            if hasattr(gt, 'tensor'):  # BaseBoxes
-                b = gt.tensor.cpu().numpy()
-                b = self._warp_and_aabb(b, H_new)
-                b[:, [0, 2]] = np.clip(b[:, [0, 2]], 0, crop.shape[1])
-                b[:, [1, 3]] = np.clip(b[:, [1, 3]], 0, crop.shape[0])
-                gt.tensor = gt.tensor.new_tensor(b)
-
-            else:  # numpy
-                b = self._warp_and_aabb(gt, H_new)
-                b[:, [0, 2]] = np.clip(b[:, [0, 2]], 0, crop.shape[1])
-                b[:, [1, 3]] = np.clip(b[:, [1, 3]], 0, crop.shape[0])
-                results['gt_bboxes'] = b
-
-        # --- optionally update keypoints ---
-        if self.transform_keypoints and 'gt_keypoint_coords' in results:
-            kpts = results['gt_keypoint_coords']
-            # (N,1,2) or (N,2)
-            reshape_1d = False
-            if kpts.ndim == 3:
-                reshape_1d = True
-                kpts = kpts[:, 0, :]
-            kpts = self._apply_homography(kpts, H_new)
-            if reshape_1d:
-                kpts = kpts[:, None, :]
-            results['gt_keypoint_coords'] = kpts
-
-        # --- finalize ---
-        results['img'] = crop
-        results['img_shape'] = (crop.shape[0], crop.shape[1])
-
-        return results
-
-    def __repr__(self):
-        return f"{self.__class__.__name__}(transform_keypoints={self.transform_keypoints})"
 
