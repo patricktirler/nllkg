@@ -28,6 +28,10 @@ class KeypointRelationMetric(BaseMetric):
         collect_device (str): Device for collecting results ('cpu' or 'gpu'). Defaults to 'cpu'.
         prefix (str, optional): Prefix for metric names. Defaults to None.
         save_path_preds (str, optional): Path to save prediction results. Defaults to None.
+        crop_sizes (Sequence[str], optional): List of target crop sizes as tuples (height, width)
+            (e.g., [(2400, 3999), (800, 1333)]).
+            If provided, all occurring crop sizes are mapped to the closest target size by area.
+            If None (default), uses all crop sizes found in the data.
     """
     default_prefix: Optional[str] = 'keypointgraph'
 
@@ -40,6 +44,7 @@ class KeypointRelationMetric(BaseMetric):
                  collect_device: str = 'cpu',
                  prefix: Optional[str] = None,
                  save_path_preds: str = None,
+                 crop_sizes: Optional[Sequence[str]] = None,
                  **kwargs) -> None:
         super().__init__(collect_device=collect_device, prefix=prefix)
         self.distance_thresholds = tuple(distance_thresholds)
@@ -48,6 +53,18 @@ class KeypointRelationMetric(BaseMetric):
         self.keypoint_score_threshold = float(keypoint_score_threshold)
         self.relation_score_thresholds = tuple(relation_score_thresholds)
         self.save_path_preds = save_path_preds
+        if crop_sizes is not None:
+            normalized_sizes = []
+            for c in crop_sizes:
+                if isinstance(c, (tuple, list)):
+                    # Convert tuple/list (height, width) to string "WxH" format (to match get_crop_size output)
+                    normalized_sizes.append(f"{int(c[1])}x{int(c[0])}")
+                else:
+                    # Already a string, just normalize
+                    normalized_sizes.append(str(c))
+            self.crop_sizes = tuple(normalized_sizes)
+        else:
+            self.crop_sizes = None
 
     def process(self, data_batch: dict, data_samples: Sequence[dict]) -> None:
         for data_sample in data_samples:
@@ -187,8 +204,6 @@ class KeypointRelationMetric(BaseMetric):
         logger.info("Keypoints: Precision/Recall/F1 at fixed distance threshold %.4f (relative to max(img dim))", self.keypoint_distance_threshold)
         for s, p, r_, f in zip(kp_thr, kp_prec, kp_rec, kp_f1):
             logger.info("  score>=%.2f -> Precision:%.3f Recall:%.3f F1:%.3f", s, p, r_, f)
-            metrics[f"keypoints/prec@score{float(s):.2f}"] = float(p)
-            metrics[f"keypoints/rec@score{float(s):.2f}"] = float(r_)
             metrics[f"keypoints/f1@score{float(s):.2f}"] = float(f)
         logger.info("")
 
@@ -213,6 +228,30 @@ class KeypointRelationMetric(BaseMetric):
 
         crop_size_array = np.array([get_crop_size(result) for result in results], dtype=object)
         unique_crop_sizes = np.unique(crop_size_array)
+
+        # Map crop sizes to specified crop sizes if provided
+        def get_crop_size_area(crop_size_str):
+            w, h = map(int, crop_size_str.split("x"))
+            return w * h
+
+        if self.crop_sizes is not None:
+            # Create a mapping from actual crop sizes to specified crop sizes based on area
+            crop_size_mapping = {}
+            for actual_size in unique_crop_sizes:
+                actual_area = get_crop_size_area(actual_size)
+                # Find the closest specified crop size by area
+                closest_size = min(self.crop_sizes, key=lambda s: abs(get_crop_size_area(s) - actual_area))
+                crop_size_mapping[actual_size] = closest_size
+            
+            # Remap the crop_size_array
+            crop_size_array = np.array([crop_size_mapping[cs] for cs in crop_size_array], dtype=object)
+            unique_crop_sizes = np.unique(crop_size_array)
+            sorted_crop_sizes = sorted(self.crop_sizes, key=get_crop_size_area, reverse=True)
+        else:
+            crop_size_mapping = None
+            def crop_area(crop_size_str):
+                return get_crop_size_area(crop_size_str)
+            sorted_crop_sizes = sorted(unique_crop_sizes, key=crop_area, reverse=True)
 
         # ------------------------------------------------------------
         # Collect all unique label names globally
@@ -247,19 +286,7 @@ class KeypointRelationMetric(BaseMetric):
         dist_headers = [f"{t:.4f}" for t in sorted_dist_thresholds]
         col_widths = [max(len(h), 7) for h in dist_headers]
 
-        def crop_area(crop_size_str):
-            w, h = crop_size_str.split("x")
-            return int(w) * int(h)
-
-        # Sort crop sizes by area descending
-        sorted_crop_sizes = sorted(
-            unique_crop_sizes,
-            key=crop_area,
-            reverse=True
-        )
-
         for crop_size in sorted_crop_sizes:
-
             crop_mask = crop_size_array == crop_size
             crop_indices = np.where(crop_mask)[0]
 
@@ -289,6 +316,8 @@ class KeypointRelationMetric(BaseMetric):
             logger.info("    %s", separator)
 
             # ---- Rows ----
+            all_label_recalls = []  # Track recalls for averaging
+            
             for label_name in unique_label_names_all:
 
                 label_mask = np.array([label_name in np.unique(label_names) for label_names in crop_gt_label_names_array])
@@ -329,6 +358,7 @@ class KeypointRelationMetric(BaseMetric):
                 )
 
                 label_recalls = np.asarray(label_recalls, dtype=float)
+                all_label_recalls.append(label_recalls)
 
                 recall_values = [f"{label_recalls[i]:.3f}" for i in sorted_dist_indices]
                 recall_str = " | ".join(
@@ -339,6 +369,26 @@ class KeypointRelationMetric(BaseMetric):
                     "    %s | %s",
                     str(label_name).ljust(label_col_width),
                     recall_str
+                )
+
+            # ---- Average row ----
+            if all_label_recalls:
+                separator = (
+                    "-" * label_col_width
+                    + "-+-"
+                    + "-+-".join(["-" * w for w in col_widths])
+                )
+                logger.info("    %s", separator)
+                
+                avg_recalls = np.mean(all_label_recalls, axis=0)
+                avg_recall_values = [f"{avg_recalls[i]:.3f}" for i in sorted_dist_indices]
+                avg_recall_str = " | ".join(
+                    [v.rjust(w) for v, w in zip(avg_recall_values, col_widths)]
+                )
+                logger.info(
+                    "    %s | %s",
+                    "AVERAGE".ljust(label_col_width),
+                    avg_recall_str
                 )
 
             logger.info("")
@@ -372,8 +422,6 @@ class KeypointRelationMetric(BaseMetric):
                 logger.info("  Relation: %s", rel)
                 for s, p, r_, f in zip(thrs, precs, recs, f1s):
                     logger.info("    rel_score>=%.2f -> Precision:%.3f Recall:%.3f F1:%.3f", s, p, r_, f)
-                    metrics[f"relations/{rel}/prec@score{float(s):.2f}"] = float(p)
-                    metrics[f"relations/{rel}/rec@score{float(s):.2f}"] = float(r_)
                     metrics[f"relations/{rel}/f1@score{float(s):.2f}"] = float(f)
                 logger.info("")
         else:
