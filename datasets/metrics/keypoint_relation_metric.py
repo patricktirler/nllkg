@@ -22,7 +22,7 @@ class KeypointRelationMetric(BaseMetric):
         keypoint_score_threshold (float): Fixed keypoint score threshold for recall@distance and relation metrics. Defaults to 0.3.
         keypoint_distance_threshold (float): Fixed distance threshold for keypoint PR/F1 vs score. Defaults to 0.005.
         keypoint_score_thresholds (Sequence[float]): Score thresholds to sweep for keypoint PR/F1. Defaults to (0.3, 0.5, 0.7).
-        relation_score_thresholds (Sequence[float]): Relation score thresholds to sweep. Defaults to (0.3, 0.5, 0.7).
+        relation_score_threshold (float): Relation score threshold for precision/recall/F1 computation. Defaults to 0.3.
         distance_thresholds (Sequence[float]): Distance thresholds for recall@distance.
             Values in [0, 1] relative to max(img_w, img_h). Defaults to (0.001, 0.005, 0.01, 0.05).
         collect_device (str): Device for collecting results ('cpu' or 'gpu'). Defaults to 'cpu'.
@@ -39,7 +39,7 @@ class KeypointRelationMetric(BaseMetric):
                  keypoint_score_threshold: float = 0.3,
                  keypoint_distance_threshold: float = 0.005,
                  keypoint_score_thresholds: Sequence[float] = (0.3, 0.5, 0.7),
-                 relation_score_thresholds: Sequence[float] = (0.3, 0.5, 0.7),
+                 relation_score_threshold: float = 0.3,
                  distance_thresholds: Sequence[float] = (0.001, 0.005, 0.01, 0.05),
                  collect_device: str = 'cpu',
                  prefix: Optional[str] = None,
@@ -51,7 +51,7 @@ class KeypointRelationMetric(BaseMetric):
         self.keypoint_distance_threshold = float(keypoint_distance_threshold)
         self.keypoint_score_thresholds = tuple(keypoint_score_thresholds)
         self.keypoint_score_threshold = float(keypoint_score_threshold)
-        self.relation_score_thresholds = tuple(relation_score_thresholds)
+        self.relation_score_threshold = float(relation_score_threshold)
         self.save_path_preds = save_path_preds
         if crop_sizes is not None:
             normalized_sizes = []
@@ -209,7 +209,7 @@ class KeypointRelationMetric(BaseMetric):
 
         # 2) Keypoint recall vs distance thresholds at fixed keypoint score
         logger.info(
-            "Keypoints: Recall@distance grouped by crop size and label name (score>=%.2f)",
+            "Keypoints: Recall@distance (score>=%.2f)",
             self.keypoint_score_threshold
         )
 
@@ -395,7 +395,12 @@ class KeypointRelationMetric(BaseMetric):
 
         logger.info("")
 
-        # 3) Relation PR/F1 vs relation score thresholds at same fixed keypoint score and distance
+        # 3) Relations: Precision/Recall/F1 at fixed relation score threshold
+        logger.info(
+            "Relations: Precision/Recall/F1 (keypoint_score>=%.2f, dist<=%.4f, rel_score>=%.2f)",
+            self.keypoint_score_threshold, self.keypoint_distance_threshold, self.relation_score_threshold
+        )
+        
         # Filter out images without relations or predictions
         if any(g is not None and p is not None for g, p in zip(gt_relations_list, pred_relations_list)):
             relation_curves = compute_precision_recall_relation(
@@ -410,23 +415,86 @@ class KeypointRelationMetric(BaseMetric):
                 max_dim_list=max_dim_list,
                 keypoint_score_threshold=self.keypoint_score_threshold,
                 keypoint_distance_threshold=self.keypoint_distance_threshold,
-                relation_score_thresholds=np.array(self.relation_score_thresholds, dtype=float),
+                relation_score_thresholds=np.array([self.relation_score_threshold], dtype=float),
                 distances_list=distances_list
             )
-            logger.info("Relations: Precision/Recall/F1 vs relation score thresholds (score>=%.2f, dist<=%.4f)", self.keypoint_score_threshold, self.keypoint_distance_threshold)
-            for rel, curves in relation_curves.items():
-                thrs = curves['thresholds']
-                precs = curves['precision']
-                recs = curves['recall']
-                f1s = curves['f1']
-                logger.info("  Relation: %s", rel)
-                for s, p, r_, f in zip(thrs, precs, recs, f1s):
-                    logger.info("    rel_score>=%.2f -> Precision:%.3f Recall:%.3f F1:%.3f", s, p, r_, f)
-                    metrics[f"relations/{rel}/f1@score{float(s):.2f}"] = float(f)
-                logger.info("")
+            
+            if relation_curves:
+                # Prepare table: Relation | Precision | Recall | F1
+                rel_col_width = max(
+                    max(len(str(rel)) for rel in relation_curves.keys()),
+                    len("Relation"),
+                    15
+                )
+                metric_col_width = 10
+                
+                # Header
+                header = (
+                    "Relation".ljust(rel_col_width)
+                    + " | "
+                    + "Precision".center(metric_col_width)
+                    + " | "
+                    + "Recall".center(metric_col_width)
+                    + " | "
+                    + "F1".center(metric_col_width)
+                )
+                logger.info("  %s", header)
+                
+                separator = (
+                    "-" * rel_col_width
+                    + "-+-"
+                    + "-" * metric_col_width
+                    + "-+-"
+                    + "-" * metric_col_width
+                    + "-+-"
+                    + "-" * metric_col_width
+                )
+                logger.info("  %s", separator)
+                
+                # Rows for each relation
+                all_prec = []
+                all_rec = []
+                all_f1 = []
+                
+                for rel in sorted(relation_curves.keys()):
+                    curves = relation_curves[rel]
+                    prec = float(curves['precision'][0])
+                    rec = float(curves['recall'][0])
+                    f1 = float(curves['f1'][0])
+                    
+                    all_prec.append(prec)
+                    all_rec.append(rec)
+                    all_f1.append(f1)
+                    
+                    logger.info(
+                        "  %s | %s | %s | %s",
+                        str(rel).ljust(rel_col_width),
+                        f"{prec:.3f}".center(metric_col_width),
+                        f"{rec:.3f}".center(metric_col_width),
+                        f"{f1:.3f}".center(metric_col_width)
+                    )
+                    metrics[f"relations/{rel}/f1@score{self.relation_score_threshold:.2f}"] = f1
+                
+                # Average row
+                if all_prec:
+                    logger.info("  %s", separator)
+                    avg_prec = np.mean(all_prec)
+                    avg_rec = np.mean(all_rec)
+                    avg_f1 = np.mean(all_f1)
+                    
+                    logger.info(
+                        "  %s | %s | %s | %s",
+                        "AVERAGE".ljust(rel_col_width),
+                        f"{avg_prec:.3f}".center(metric_col_width),
+                        f"{avg_rec:.3f}".center(metric_col_width),
+                        f"{avg_f1:.3f}".center(metric_col_width)
+                    )
+            else:
+                logger.info("  No relations found in predictions/annotations.")
         else:
-            logger.info("Relations: no relation annotations/predictions available.")
-            logger.info("")
+            logger.info("  No relation annotations/predictions available.")
+        
+        logger.info("")
 
         if self.save_path_preds is not None:
             metrics_file = os.path.join(self.save_path_preds, "metrics.json")
