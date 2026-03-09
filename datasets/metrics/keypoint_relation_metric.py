@@ -256,8 +256,7 @@ class KeypointRelationMetric(BaseMetric):
         # ------------------------------------------------------------
         # Collect all unique label names globally
         # ------------------------------------------------------------
-        all_label_names_per_image = [set(np.unique(label_names)) for label_names in gt_label_names_list]
-        unique_label_names_all = sorted(set().union(*all_label_names_per_image))
+        unique_label_names_all = sorted(set(str(x) for label_names in gt_label_names_list for x in np.unique(label_names)))
 
         # Convert lists to numpy arrays once
         gt_coords_array = np.array(gt_coords_list, dtype=object)

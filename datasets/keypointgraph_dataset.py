@@ -190,23 +190,11 @@ class KeypointGraphDataset(CocoDataset):
                         cropped_data['crop_bbox'] = crop_bbox  # (x1, y1, x2, y2)
                         cropped_data_by_size[(crop_h_org, crop_w_org)].append(cropped_data)
         
-        # Balance the number of items across crop sizes by sampling
-        crop_size_counts = {crop_size: len(items) for crop_size, items in cropped_data_by_size.items()}
-        max_count = max(crop_size_counts.values()) if crop_size_counts else 0
-        
+        # Concatenate all cropped data
         cropped_data_list = []
         for crop_size in self.crop_sizes:
             items = cropped_data_by_size[crop_size]
-            current_count = len(items)
-            
-            # Add all items
             cropped_data_list.extend(items)
-            
-            # If this crop size has fewer items than max, sample with replacement to fill up
-            if current_count < max_count:
-                deficit = max_count - current_count
-                sampled_items = np.random.choice(items, size=deficit, replace=True)
-                cropped_data_list.extend(sampled_items)
         
         return cropped_data_list
 
