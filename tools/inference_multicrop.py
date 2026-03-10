@@ -9,10 +9,10 @@ import shutil
 from mmengine.config import Config
 
 
-from nllkp.datasets.keypointgraph_dataset import generate_crop_coordinates
-from nllkp.tools.inference import predinstances2dict, OpenVocPoseInferencer
-from nllkp.tools.graph_grouping import group_keypoints_into_instances, InstanceGroup, CheckMergeFn
-from nllkp.tools.graph_fitting import ShapeTemplate
+from nllkg.datasets.keypointgraph_dataset import generate_crop_coordinates
+from nllkg.tools.inference import predinstances2dict, OpenVocPoseInferencer
+from nllkg.tools.graph_grouping import group_keypoints_into_instances, InstanceGroup, CheckMergeFn
+from nllkg.tools.graph_fitting import ShapeTemplate
 
 
 
