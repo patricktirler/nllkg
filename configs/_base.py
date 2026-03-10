@@ -1,6 +1,6 @@
 _base_ = 'mmdet::grounding_dino/grounding_dino_swin-t_finetune_16xb2_1x_coco.py'
 
-custom_imports = dict(imports=['nllkp'])
+custom_imports = dict(imports=['nllkg'])
 
 dataset_type = 'KeypointGraphDataset'
 
@@ -33,7 +33,7 @@ model = dict(
             use_sigmoid=True,
             gamma=2.0,
             alpha=0.25,
-            loss_weight=10.0
+            loss_weight=5.0
         )
     ),
     train_cfg=dict(
