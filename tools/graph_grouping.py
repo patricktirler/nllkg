@@ -21,8 +21,8 @@ class InstanceGroup:
 
 
 # CheckMergeFn is a callable that takes two InstanceGroup objects, two node indices (u, v),
-# and a relation type integer, and returns True iff the groups may be merged.
-CheckMergeFn = Callable[[InstanceGroup, InstanceGroup, int, int, int], bool]
+# and a relation label name string, and returns True iff the groups may be merged.
+CheckMergeFn = Callable[[InstanceGroup, InstanceGroup, int, int, str], bool]
 
 
 def group_keypoints_into_instances(
@@ -32,6 +32,7 @@ def group_keypoints_into_instances(
     keypoint_labels: Optional[np.ndarray] = None,
     keypoint_coords: Optional[np.ndarray] = None,
     keypoint_label_names: Optional[np.ndarray] = None,
+    relation_label_names: Optional[np.ndarray] = None,
     keypoint_score_threshold: float = 0.0,
     min_edge_score: float = 0.0,
 ) -> List[InstanceGroup]:
@@ -40,11 +41,16 @@ def group_keypoints_into_instances(
     Args:
         keypoint_scores: (N,) scores.
         relation_scores: (N, N, R) relation score tensor (R >= 1).
-        check_merge: (grp_u, grp_v, u, v, rel_type) -> bool. If True, groups are merged.
-                    u, v are global node indices. rel_type is argmax relation type for (u,v).
+        check_merge: (grp_u, grp_v, u, v, rel_name) -> bool. If True, groups are merged.
+                    u, v are global node indices. rel_name is the name of the best-scoring
+                    relation type for (u,v) (or its string index if relation_label_names
+                    is not provided).
         keypoint_labels: Optional (N,) integer labels.
         keypoint_coords: Optional (N,2) coordinates corresponding to each keypoint.
         keypoint_label_names: Optional (N,) string names corresponding to keypoint labels.
+        relation_label_names: Optional (R,) string names for each relation type. When
+                              provided, the resolved name is passed to check_merge instead
+                              of the raw integer index.
         keypoint_score_threshold: Minimum score for keypoints to be considered.
         min_edge_score: Minimum edge score required to consider merging two groups.
 
@@ -54,7 +60,6 @@ def group_keypoints_into_instances(
     # TODO: This algorithm groups greedily based on max relation scores.
     # This means connectivity between two groups is determined by the maximum scoring edge only,
     # which may not be optimal. A more robust approach could consider the average of all edges between two groups.
-
 
     assert keypoint_labels is None or keypoint_labels.ndim == 1
     assert keypoint_scores.ndim == 1
@@ -68,7 +73,7 @@ def group_keypoints_into_instances(
     assert N == N2, "relation_scores must be square in first two dims"
     if keypoint_coords is not None:
         assert keypoint_coords.shape == (N, 2), "keypoint_coords must be (N,2)"
-    
+
     # Filter keypoints by score threshold
     keep = keypoint_scores >= keypoint_score_threshold
     keypoint_scores = keypoint_scores[keep]
@@ -93,17 +98,18 @@ def group_keypoints_into_instances(
             keypoint_scores=np.array([keypoint_scores[i]], dtype=keypoint_scores.dtype),
             adjacency_matrix=np.zeros((1, 1, R), dtype=relation_scores.dtype),
             keypoint_coords=(None if keypoint_coords is None else np.array([keypoint_coords[i]], dtype=keypoint_coords.dtype)),
-            keypoint_label_names = (None if keypoint_label_names is None else np.array([keypoint_label_names[i]]))
+            keypoint_label_names=(None if keypoint_label_names is None else np.array([keypoint_label_names[i]]))
         ))
     node_to_group = np.arange(N)  # global node id -> index into groups list
 
-    # Build edge list with max score and relation type per pair (i<j)
+    # Build edge list with max score and relation type per pair (i<j).
     upper_i, upper_j = np.triu_indices(N, k=1)
     edge_relations = relation_scores[upper_i, upper_j, :]  # (E, R)
+
     best_relation_type = np.argmax(edge_relations, axis=1)  # (E,)
     best_relation_score = edge_relations[np.arange(edge_relations.shape[0]), best_relation_type]  # (E,)
 
-    # Filter edges by min_edge_score
+    # Filter edges by min_edge_score.
     valid_mask = best_relation_score >= min_edge_score
     sorted_indices = np.argsort(-best_relation_score[valid_mask])  # descending order
 
@@ -121,7 +127,9 @@ def group_keypoints_into_instances(
 
         group_u = groups[group_u_idx]
         group_v = groups[group_v_idx]
-        if not check_merge(group_u, group_v, int(u), int(v), int(rel_type)):
+
+        rel_name = relation_label_names[int(rel_type)] if relation_label_names is not None else str(int(rel_type))
+        if not check_merge(group_u, group_v, int(u), int(v), rel_name):
             continue
         merged_group = _merge_groups(group_u, group_v, relation_scores)
 
@@ -150,7 +158,7 @@ def make_check_merge_max_label(max_per_label) -> CheckMergeFn:
     Returns:
         CheckMergeFn: A function that returns True if merging the two groups would not violate per-label limits.
     """
-    def check_merge(grp_u, grp_v, u, v, rel_type):
+    def check_merge(grp_u, grp_v, u, v, rel_name: str):
         merged_labels = np.concatenate([grp_u.keypoint_labels, grp_v.keypoint_labels])
         # Count occurrences per label
         unique, counts = np.unique(merged_labels, return_counts=True)

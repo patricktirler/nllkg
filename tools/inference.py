@@ -105,7 +105,7 @@ def predinstances2dict(pred_instances: PredType) -> dict:
         'keypoint_labels': pred_instances.labels.tolist(),
         'keypoint_scores': pred_instances.scores.tolist(),
         'keypoint_coords': pred_instances.keypoints.tolist(),
-        'keypoint_relation_scores': pred_instances.relation_scores.tolist(),
+        'relation_scores': pred_instances.relation_scores.tolist(),
     }
 
 

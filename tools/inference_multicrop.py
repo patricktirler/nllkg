@@ -197,9 +197,7 @@ def inference_multicrop(
                     kp_coords = np.asarray(rdict.get("keypoint_coords", []))
                     kp_scores = np.asarray(rdict.get("keypoint_scores", []))
                     kp_labels = rdict.get("keypoint_label_names", [])
-                    rel_scores = np.asarray(
-                        rdict.get("keypoint_relation_scores", [])
-                    )
+                    rel_scores = np.asarray(rdict.get("relation_scores", []))
 
                     if len(kp_coords) == 0:
                         continue
@@ -221,13 +219,14 @@ def inference_multicrop(
                         "keypoint_coords": kp_coords.tolist(),
                         "keypoint_scores": kp_scores.tolist(),
                         "keypoint_label_names": kp_labels,
-                        "keypoint_relation_scores": (
+                        "relation_label_names": [l.strip() for l in relation_texts.split('.')],
+                        "relation_scores": (
                             rel_scores.tolist() if rel_scores.size > 0 else []
                         ),
                         "crop_bbox": (x1, y1, x2, y2),
                     })
 
-            # Save final JSON
+            # Save final JSONs
             save_image_inference_results(
                 img_name,
                 crop_results_by_size,
@@ -279,6 +278,7 @@ def save_image_inference_results(
 def group_keypoints_multicrop(
     inference_json_path: str,
     check_merge_fn: CheckMergeFn,
+    relation_label_names: List[str] = None,
     crop_size_key: str | None = None,
     keypoint_score_threshold: float = 0.3,
     relation_score_threshold: float = 0.3,
@@ -299,6 +299,8 @@ def group_keypoints_multicrop(
     check_merge_fn : callable
         Function used to determine whether two keypoints or groups may be merged.
         Passed directly to `group_keypoints_into_instances`.
+    relation_label_names : List[str], optional
+        List of relation label names to use during grouping. If None, all relation labels from the JSON are used.
     crop_size_key : str, optional
         Crop size identifier to use (e.g., "1024x1024").
         If None, the largest crop size (by area) is selected automatically.
@@ -339,19 +341,20 @@ def group_keypoints_multicrop(
     groups_per_crop = []
 
     for crop_result in crop_results:
+        relation_scores = np.asarray(crop_result.get("relation_scores", []))
+        relation_label_names_all = crop_result.get("relation_label_names", [])
+        if relation_label_names is not None:
+            relation_indices = [i for i, name in enumerate(relation_label_names_all) if name in relation_label_names]
+            relation_scores = relation_scores[:, :, relation_indices]
+        else:
+            relation_label_names = relation_label_names_all
+
         groups = group_keypoints_into_instances(
-            keypoint_scores=np.asarray(
-                crop_result.get("keypoint_scores", [])
-            ),
-            keypoint_coords=np.asarray(
-                crop_result.get("keypoint_coords", [])
-            ),
-            relation_scores=np.asarray(
-                crop_result.get("keypoint_relation_scores", [])
-            ),
-            keypoint_label_names=crop_result.get(
-                "keypoint_label_names", []
-            ),
+            keypoint_scores=np.asarray(crop_result.get("keypoint_scores", [])),
+            keypoint_coords=np.asarray(crop_result.get("keypoint_coords", [])),
+            relation_scores=relation_scores,
+            keypoint_label_names=crop_result.get("keypoint_label_names", []),
+            relation_label_names=relation_label_names,
             check_merge=check_merge_fn,
             keypoint_score_threshold=keypoint_score_threshold,
             min_edge_score=relation_score_threshold,
