@@ -11,7 +11,7 @@ from mmengine.config import Config
 
 from nllkg.datasets.keypointgraph_dataset import generate_crop_coordinates
 from nllkg.tools.inference import predinstances2dict, OpenVocPoseInferencer
-from nllkg.tools.graph_grouping import group_keypoints_into_instances, InstanceGroup, CheckMergeFn
+from nllkg.tools.graph_grouping import group_keypoints_into_instances, InstanceGroup, IsValidFn
 from nllkg.tools.graph_fitting import ShapeTemplate
 
 
@@ -274,10 +274,217 @@ def save_image_inference_results(
 
     return json_path
 
+def aggregate_keypoints_multicrop(
+    inference_json_path: str,
+    crop_size_key: str | None = None,
+    keypoint_score_threshold: float = 0.3,
+    dedup_distance_threshold: float = 10.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Aggregate keypoints and relation scores across all crops of a given size
+    into a single deduplicated set of global keypoints and a (N, N, R) relation matrix.
+
+    For each pair of raw detections within `dedup_distance_threshold` pixels of
+    each other (and sharing the same label), only the highest-scoring one is kept.
+    Relation scores from all crops are accumulated into the global matrix by taking
+    the element-wise maximum over all crops that observed a given pair.
+
+    Parameters
+    ----------
+    inference_json_path : str
+        Path to the per-image JSON file produced by `inference_multicrop`.
+    crop_size_key : str, optional
+        Crop size identifier. If None, the smallest available
+        crop size is used.
+    keypoint_score_threshold : float, default=0.3
+        Minimum keypoint confidence score to include.
+    dedup_distance_threshold : float, default=10.0
+        Maximum pixel distance between two detections of the same label for them
+        to be considered the same physical point.
+
+    Returns
+    -------
+    keypoint_coords : np.ndarray, shape (N, 2)
+        Deduplicated keypoint coordinates in full-image space.
+    keypoint_scores : np.ndarray, shape (N,)
+        Confidence scores for each deduplicated keypoint.
+    keypoint_label_names : np.ndarray, shape (N,)
+        Label name strings for each deduplicated keypoint.
+    relation_scores : np.ndarray, shape (N, N, R)
+        Aggregated relation scores. Entry [i, j, r] is the maximum relation score
+        observed for the deduplicated pair (i, j) across all crops. Pairs that
+        were never co-observed in any crop have a score of 0.
+    relation_label_names : np.ndarray, shape (R,)
+        Relation label name strings corresponding to the R relation channels.
+    """
+    with open(inference_json_path, "r") as f:
+        data = json.load(f)
+
+    crop_results_by_size = data["crop_results_by_size"]
+
+    if crop_size_key is None:
+        crop_size_key = min(
+            crop_results_by_size.keys(),
+            key=lambda k: eval(k.replace('x', '*'))
+        )
+
+    if crop_size_key not in crop_results_by_size:
+        raise KeyError(
+            f"Crop size '{crop_size_key}' not found. "
+            f"Available: {list(crop_results_by_size.keys())}"
+        )
+
+    crop_results = crop_results_by_size[crop_size_key]
+
+    # ------------------------------------------------------------------
+    # Step 1: Pool all raw detections across crops
+    # ------------------------------------------------------------------
+    # Each raw detection keeps a back-reference to its source crop and its
+    # local index within that crop — needed to look up relation_scores later.
+
+    raw_coords  = []   # (M, 2)  full-image coords
+    raw_scores  = []   # (M,)
+    raw_labels  = []   # (M,)    str
+    raw_crop_idx = []  # (M,)    which crop this came from
+    raw_local_idx = [] # (M,)    index within that crop's arrays
+
+    relation_label_names = None
+
+    for ci, crop in enumerate(crop_results):
+        coords = np.asarray(crop.get("keypoint_coords", []), dtype=float)
+        scores = np.asarray(crop.get("keypoint_scores",  []), dtype=float)
+        labels = crop.get("keypoint_label_names", [])
+
+        if relation_label_names is None:
+            relation_label_names = [l.strip() for l in crop.get("relation_label_names", [])]
+
+        if len(coords) == 0:
+            continue
+
+        keep = scores >= keypoint_score_threshold
+        coords = coords[keep]
+        scores = scores[keep]
+        labels = [labels[i] for i, k in enumerate(keep) if k]
+        local_indices = np.where(keep)[0]
+
+        for li, (coord, score, label) in enumerate(zip(coords, scores, labels)):
+            raw_coords.append(coord)
+            raw_scores.append(score)
+            raw_labels.append(label)
+            raw_crop_idx.append(ci)
+            raw_local_idx.append(local_indices[li])
+
+    if not raw_coords:
+        R = len(relation_label_names) if relation_label_names else 0
+        return (
+            np.empty((0, 2), dtype=float),
+            np.empty((0,),   dtype=float),
+            np.empty((0,),   dtype=str),
+            np.empty((0, 0, R), dtype=float),
+            np.asarray(relation_label_names or []),
+        )
+
+    raw_coords    = np.asarray(raw_coords,    dtype=float)   # (M, 2)
+    raw_scores    = np.asarray(raw_scores,    dtype=float)   # (M,)
+    raw_labels    = np.asarray(raw_labels)                   # (M,)
+    raw_crop_idx  = np.asarray(raw_crop_idx,  dtype=int)     # (M,)
+    raw_local_idx = np.asarray(raw_local_idx, dtype=int)     # (M,)
+    M = len(raw_coords)
+    R = len(relation_label_names) if relation_label_names else 0
+
+    # ------------------------------------------------------------------
+    # Step 2: Greedy spatial deduplication
+    # Process detections in descending score order so that when two
+    # detections are duplicates, the higher-scoring one is the survivor.
+    # ------------------------------------------------------------------
+
+    # raw_to_dedup[m] = index of the deduplicated keypoint that raw detection m maps to.
+    raw_to_dedup = np.full(M, -1, dtype=int)
+    dedup_coords  = []
+    dedup_scores  = []
+    dedup_labels  = []
+
+    order = np.argsort(-raw_scores)   # descending score
+
+    for m in order:
+        coord = raw_coords[m]
+        label = raw_labels[m]
+
+        # Check against already-accepted deduplicated points of the same label
+        matched = -1
+        for di, (dc, dl) in enumerate(zip(dedup_coords, dedup_labels)):
+            if dl == label and np.linalg.norm(coord - dc) <= dedup_distance_threshold:
+                matched = di
+                break
+
+        if matched == -1:
+            # New unique detection
+            matched = len(dedup_coords)
+            dedup_coords.append(coord)
+            dedup_scores.append(raw_scores[m])
+            dedup_labels.append(label)
+
+        raw_to_dedup[m] = matched
+
+    N = len(dedup_coords)
+    dedup_coords = np.asarray(dedup_coords, dtype=float)   # (N, 2)
+    dedup_scores = np.asarray(dedup_scores, dtype=float)   # (N,)
+    dedup_labels = np.asarray(dedup_labels)                # (N,)
+
+    # ------------------------------------------------------------------
+    # Step 3: Accumulate relation scores into the global (N, N, R) matrix
+    # For each crop, map its local indices through raw_to_dedup and write
+    # the crop's relation block into the global matrix, taking element-wise max.
+    # ------------------------------------------------------------------
+
+    global_rel = np.zeros((N, N, R), dtype=float)
+
+    if R == 0:
+        return dedup_coords, dedup_scores, dedup_labels, global_rel, np.asarray([])
+
+    for ci, crop in enumerate(crop_results):
+        crop_rel = np.asarray(crop.get("relation_scores", []), dtype=float)
+        if crop_rel.ndim != 3 or crop_rel.shape[2] != R:
+            continue
+
+        # Find all raw detections that came from this crop
+        # and survived the score threshold (i.e. have a dedup assignment)
+        crop_mask = (raw_crop_idx == ci)
+        if not np.any(crop_mask):
+            continue
+
+        local_indices  = raw_local_idx[crop_mask]   # local position in this crop's arrays
+        dedup_indices  = raw_to_dedup[crop_mask]    # corresponding global dedup index
+
+        # Validate local indices are within the crop's relation matrix
+        valid = local_indices < crop_rel.shape[0]
+        local_indices = local_indices[valid]
+        dedup_indices = dedup_indices[valid]
+
+        if len(local_indices) == 0:
+            continue
+
+        # Extract the relation sub-matrix for the detections we kept from this crop
+        crop_rel_sub = crop_rel[np.ix_(local_indices, local_indices)]  # (k, k, R)
+
+        # Scatter into the global matrix using the dedup indices
+        global_rel[np.ix_(dedup_indices, dedup_indices)] = np.maximum(
+            global_rel[np.ix_(dedup_indices, dedup_indices)],
+            crop_rel_sub,
+        )
+
+    return (
+        dedup_coords,
+        dedup_scores,
+        dedup_labels,
+        global_rel,
+        np.asarray(relation_label_names),
+    )
+
 
 def group_keypoints_multicrop(
     inference_json_path: str,
-    check_merge_fn: CheckMergeFn,
+    is_valid_fn: IsValidFn,
     relation_label_names: List[str] = None,
     crop_size_key: str | None = None,
     keypoint_score_threshold: float = 0.3,
@@ -296,8 +503,8 @@ def group_keypoints_multicrop(
     ----------
     inference_json_path : str
         Path to the per-image JSON file produced by crop-based inference.
-    check_merge_fn : callable
-        Function used to determine whether two keypoints or groups may be merged.
+    is_valid_fn: merged_group -> bool. Receives the prospective merged
+        InstanceGroup. Returns True iff the merge should proceed.
         Passed directly to `group_keypoints_into_instances`.
     relation_label_names : List[str], optional
         List of relation label names to use during grouping. If None, all relation labels from the JSON are used.
@@ -355,7 +562,7 @@ def group_keypoints_multicrop(
             relation_scores=relation_scores,
             keypoint_label_names=crop_result.get("keypoint_label_names", []),
             relation_label_names=relation_label_names,
-            check_merge=check_merge_fn,
+            is_valid=is_valid_fn,
             keypoint_score_threshold=keypoint_score_threshold,
             min_edge_score=relation_score_threshold,
         )

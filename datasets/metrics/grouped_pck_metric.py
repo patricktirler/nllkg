@@ -10,7 +10,7 @@ from mmpose.evaluation.functional import keypoint_pck_accuracy
 
 from ...tools.graph_grouping import (
     group_keypoints_into_instances,
-    make_check_merge_max_label,
+    make_is_valid_max_label,
 )
 from ...tools.graph_matching import sequential_matching
 
@@ -106,12 +106,11 @@ class GroupedPCKAccuracy(PCKAccuracy):
             f_rel = rel_full[np.ix_(valid_idx, valid_idx, np.arange(rel_full.shape[2]))]
 
             # Group nodes into instances with per-label maxima
-            check_fn = make_check_merge_max_label(per_label_max_ids, relation_scores=f_rel)
             instance_groups = group_keypoints_into_instances(
                 keypoint_labels=f_labels,
                 keypoint_scores=f_scores,
                 relation_scores=f_rel,
-                check_merge=check_fn,
+                is_valid=make_is_valid_max_label(per_label_max_ids),
                 min_edge_score=self.edge_score_thresh,
             )
 
