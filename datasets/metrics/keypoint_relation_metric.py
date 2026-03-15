@@ -409,14 +409,12 @@ class KeypointRelationMetric(BaseMetric):
                     f"{avg_auc:.3f}".rjust(auc_col_w),
                 )
 
-                metrics[f"keypoints/recall_auc_{auc_mode}/{crop_size}/average"] = avg_auc
 
             logger.info("")
 
         # ---- Global average AUC across crop sizes ------------------------
         if crop_avg_auc_list:
             global_avg_auc = float(np.mean(crop_avg_auc_list))
-            metrics[f"keypoints/recall_auc_{auc_mode}/average"] = global_avg_auc
 
         logger.info("")
 
@@ -494,7 +492,6 @@ class KeypointRelationMetric(BaseMetric):
                         f"{rec:.3f}".center(metric_col_width),
                         f"{f1:.3f}".center(metric_col_width),
                     )
-                    metrics[f"relations/{rel}/f1@score{self.relation_score_threshold:.2f}"] = f1
 
                 if all_prec:
                     logger.info("  %s", separator)
