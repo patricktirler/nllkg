@@ -289,7 +289,12 @@ class RelationBranch(nn.Module):
         memory_relation_text = self.memory_relation_proj(memory_relation_text)
 
         # ---- build pair indices once ----
-        row_idx, col_idx = torch.triu_indices(N, N, offset=1, device=hidden_states.device)
+        idx = torch.arange(N, device=hidden_states.device)
+        row = idx.unsqueeze(1).expand(N, N)
+        col = idx.unsqueeze(0).expand(N, N)
+        mask = row < col
+        row_idx = row[mask]
+        col_idx = col[mask]
 
         # ---- gather node features ----
         q1 = hidden_states[:, row_idx]      # (B, num_pairs, D)
