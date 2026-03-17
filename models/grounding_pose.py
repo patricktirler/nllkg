@@ -3,20 +3,55 @@ from typing import Dict, Tuple, List
 import torch
 from torch import Tensor
 from torch import nn
+import copy
 
+from mmengine.structures import InstanceData
 from mmdet.registry import MODELS
 from mmdet.structures import OptSampleList, SampleList
 from mmdet.models.detectors import GroundingDINO
+from mmdet.structures import DetDataSample
 from mmdet.models.detectors.glip import (create_positive_map, create_positive_map_label_to_token)
 
 from .decoder import GroundingPOSETransformerDecoder
+
+try:
+    from mmdeploy.core import FUNCTION_REWRITER, mark
+    from mmdeploy.utils import is_dynamic_shape
+    MMDEPLOY_AVAILABLE = True
+except ImportError:
+    MMDEPLOY_AVAILABLE = False
+
+
+@torch.fx.wrap
+def _prepare_data_samples(data_samples, token_positive_map, token_positive_map_relation):
+    """All python/mmdet object manipulation happens here, outside the trace."""
+    data_samples = copy.deepcopy(data_samples)
+    if data_samples is None:
+        data_samples = [DetDataSample()]
+    for data_sample in data_samples:
+        data_sample.token_positive_map = token_positive_map
+        data_sample.token_positive_map_relation = token_positive_map_relation
+    return data_samples
 
 
 @MODELS.register_module()
 class GroundingPOSE(GroundingDINO):
 
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, *args, keypoint_text_prompts=None, relation_text_prompts=None, deploy=False, **kwargs):
         super().__init__(*args, **kwargs)
+        if deploy:
+            self.set_text_dicts(keypoint_text_prompts, relation_text_prompts)
+        
+            if not MMDEPLOY_AVAILABLE:
+                raise RuntimeError('deploy=True in config but mmdeploy is not installed.')
+            self._register_deploy_hooks()
+
+    def _register_deploy_hooks(self):
+        GroundingPOSE.forward_deploy = mark(
+            'grounding_pose_predict',
+            inputs=['input'],
+            outputs=['keypoint_scores' 'keypoint_labels', 'keypoint_coords', 'relation_scores']
+        )(GroundingPOSE.forward_deploy)
 
     def _init_layers(self) -> None:
         decoder_cfg = self.decoder
@@ -26,6 +61,83 @@ class GroundingPOSE(GroundingDINO):
             self.language_model.language_backbone.body.language_dim,
             self.embed_dims,
             bias=True)
+
+    def set_text_dicts(self, keypoint_text_prompts=None, relation_text_prompts=None):
+        """Precompute and cache both text and relation text features as buffers."""
+        with torch.no_grad():
+
+            if keypoint_text_prompts is not None:
+
+                keypoint_text_prompts = " . ".join(keypoint_text_prompts)
+
+                token_positive_maps, keypoint_text_prompts, _, _ = self.get_tokens_positive_and_prompts(keypoint_text_prompts, custom_entities=True)
+                text_dict = self.language_model(list([keypoint_text_prompts]))
+                if self.text_feat_map is not None:
+                    text_dict['embedded'] = self.text_feat_map(text_dict['embedded'])
+
+                self.register_buffer('_cached_embedded',            text_dict['embedded'])
+                self.register_buffer('_cached_hidden',              text_dict['hidden'])
+                self.register_buffer('_cached_text_token_mask',     text_dict['text_token_mask'])
+                self.register_buffer('_cached_masks',               text_dict['masks'])
+                self.register_buffer('_cached_position_ids',        text_dict['position_ids'])
+                self._cached_token_positive_map = token_positive_maps
+
+            if relation_text_prompts is not None:
+
+                relation_text_prompts = " . ".join(relation_text_prompts)
+
+                token_positive_maps, relation_text_prompts, _, _ = self.get_tokens_positive_and_prompts(relation_text_prompts, custom_entities=True)
+                relation_text_dict = self.language_model(list([relation_text_prompts]))
+                if self.text_feat_map_relations is not None:
+                    relation_text_dict['embedded'] = self.text_feat_map_relations(relation_text_dict['embedded'])
+
+                self.register_buffer('_cached_rel_embedded',            relation_text_dict['embedded'])
+                self.register_buffer('_cached_rel_hidden',              relation_text_dict['hidden'])
+                self.register_buffer('_cached_rel_text_token_mask',     relation_text_dict['text_token_mask'])
+                self.register_buffer('_cached_rel_masks',               relation_text_dict['masks'])
+                self.register_buffer('_cached_rel_position_ids',        relation_text_dict['position_ids'])
+                self._cached_rel_token_positive_map = token_positive_maps
+
+    def get_cached_keypoint_text_dict(self):
+        assert hasattr(self, '_cached_embedded'), 'text_dict not cached. '
+        return {
+            'embedded':        self._cached_embedded,
+            'hidden':          self._cached_hidden,
+            'text_token_mask': self._cached_text_token_mask,
+            'masks':           self._cached_masks,
+            'position_ids':    self._cached_position_ids,
+        }
+
+    def get_cached_relation_text_dict(self):
+        assert hasattr(self, '_cached_rel_embedded'), 'relation_text_dict not cached. '
+        return {
+            'embedded':        self._cached_rel_embedded,
+            'hidden':          self._cached_rel_hidden,
+            'text_token_mask': self._cached_rel_text_token_mask,
+            'masks':           self._cached_rel_masks,
+            'position_ids':    self._cached_rel_position_ids,
+        }
+    
+    def forward_deploy(self, batch_inputs, data_samples):
+        """Single-pass forward used during ONNX export."""
+        text_dict  = self.get_cached_keypoint_text_dict()
+        data_samples = _prepare_data_samples(data_samples, 
+                                             self._cached_token_positive_map, 
+                                             self._cached_rel_token_positive_map)
+        
+        img_feats = self.extract_feat(batch_inputs)
+        head_inputs_dict = self.forward_transformer(img_feats, text_dict, data_samples)
+        predictions, relation_predictions = self.bbox_head.predict_onnx(**head_inputs_dict, batch_data_samples=data_samples)
+        
+        outputs = []
+        for (scores, labels, keypoints, _), relation_scores in zip(predictions, relation_predictions):
+            outputs.append((scores, labels, keypoints, relation_scores))
+        
+        return outputs
+    
+    def forward(self, inputs: torch.Tensor, data_samples: OptSampleList = None, mode: str = 'tensor', **kwargs):
+        """Standard forward; deploy rewriter redirects here during export."""
+        return super().forward(inputs, data_samples, mode, **kwargs)
 
     def get_positive_map(self, tokenized, tokens_positive):
         positive_map = create_positive_map(tokenized, tokens_positive, self.bbox_head.max_text_len) # fixed max_text_len
@@ -40,14 +152,23 @@ class GroundingPOSE(GroundingDINO):
         text_dict: Dict,
         batch_data_samples: OptSampleList = None,
     ) -> Dict:
-        encoder_inputs_dict, decoder_inputs_dict = self.pre_transformer(img_feats, batch_data_samples)
+        encoder_inputs_dict, decoder_inputs_dict = self.pre_transformer(
+            img_feats, batch_data_samples)
 
-        # combine original and relation text dict
         text_dict_relation = self.get_relation_text_dict(batch_data_samples)
-        num_tokens_org, num_tokens_relation = text_dict['embedded'].shape[1], text_dict_relation['embedded'].shape[1]
-        masks_combined = torch.zeros((text_dict['text_token_mask'].shape[0], num_tokens_org + num_tokens_relation, num_tokens_org + num_tokens_relation), device=text_dict['masks'].device, dtype=text_dict['masks'].dtype)
-        masks_combined[:, :num_tokens_org, :num_tokens_org] = text_dict['masks']
-        masks_combined[:, num_tokens_org:, num_tokens_org:] = text_dict_relation['masks']
+
+        num_tokens_org      = text_dict['embedded'].shape[1]
+        num_tokens_relation = text_dict_relation['embedded'].shape[1]
+
+        masks_combined = torch.zeros(
+            (text_dict['text_token_mask'].shape[0],
+             num_tokens_org + num_tokens_relation,
+             num_tokens_org + num_tokens_relation),
+            device=text_dict['masks'].device,
+            dtype=text_dict['masks'].dtype)
+        masks_combined[:, :num_tokens_org, :num_tokens_org]  = text_dict['masks']
+        masks_combined[:, num_tokens_org:, num_tokens_org:]  = text_dict_relation['masks']
+
         text_dict_combined = {
             'embedded': torch.cat([text_dict['embedded'], text_dict_relation['embedded']], dim=1),
             'hidden': torch.cat([text_dict['hidden'], text_dict_relation['hidden']], dim=1),
@@ -88,6 +209,9 @@ class GroundingPOSE(GroundingDINO):
 
     def get_relation_text_dict(self, batch_data_samples: SampleList) -> List[List[dict]]:
         """Get relation text dict for the relation encoder."""
+        if hasattr(self, '_cached_rel_embedded'):
+            return self.get_cached_relation_text_dict()
+
         caption_strings = []
         for data_sample in batch_data_samples:
 
@@ -178,3 +302,10 @@ class GroundingPOSE(GroundingDINO):
         head_inputs_dict['memory_text'] = memory_text
         head_inputs_dict['text_token_mask'] = text_token_mask
         return decoder_inputs_dict, head_inputs_dict
+    
+
+if MMDEPLOY_AVAILABLE:
+
+    @FUNCTION_REWRITER.register_rewriter('nllkg.models.grounding_pose.GroundingPOSE.forward')
+    def _grounding_pose_forward_deploy(self, inputs, data_samples=None, mode='tensor', **kwargs):
+        return self.forward_deploy(inputs, data_samples)
