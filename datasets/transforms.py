@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+import cv2
 from mmcv.transforms import BaseTransform
 
 from mmdet.registry import TRANSFORMS
@@ -205,11 +206,162 @@ class TransformKeypoints(BaseTransform):
 
         return results
     
-    
+
 
 @TRANSFORMS.register_module()
-class PackKeypointGraphInputs(PackDetInputs):
+class TopDownBBoxCrop(BaseTransform):
+    """Crop image to crop_bbox.
+    """
 
+    def __init__(self, transform_keypoints: bool = False, **kwargs):
+        super().__init__(**kwargs)
+        self.transform_keypoints = transform_keypoints
+
+    @staticmethod
+    def _bbox_to_corners(crop_bbox):
+        """(x1,y1,x2,y2) -> (4,2) TL,TR,BR,BL"""
+        x1, y1, x2, y2 = crop_bbox
+        return np.array(
+            [[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
+            dtype=np.float32,
+        )
+
+    @staticmethod
+    def _apply_homography(points, H):
+        """Apply homography to Nx2 points"""
+        pts = np.concatenate(
+            [points, np.ones((points.shape[0], 1), dtype=np.float32)],
+            axis=1,
+        )
+        warped = (H @ pts.T).T
+        return warped[:, :2] / warped[:, 2:3]
+
+    @staticmethod
+    def _perspective_crop(img, corners):
+        """Perspective crop using warped crop_bbox corners"""
+        w1 = np.linalg.norm(corners[1] - corners[0])
+        w2 = np.linalg.norm(corners[2] - corners[3])
+        h1 = np.linalg.norm(corners[3] - corners[0])
+        h2 = np.linalg.norm(corners[2] - corners[1])
+
+        out_w = max(1, int(round(max(w1, w2))))
+        out_h = max(1, int(round(max(h1, h2))))
+
+        dst = np.array(
+            [[0, 0],
+             [out_w - 1, 0],
+             [out_w - 1, out_h - 1],
+             [0, out_h - 1]],
+            dtype=np.float32,
+        )
+
+        H_crop = cv2.getPerspectiveTransform(
+            corners.astype(np.float32), dst
+        )
+        crop = cv2.warpPerspective(img, H_crop, (out_w, out_h))
+        return crop, H_crop
+
+    @staticmethod
+    def _warp_and_aabb(bboxes, H):
+        """Warp bboxes by H and return axis-aligned boxes."""
+        warped_boxes = []
+        for b in bboxes:
+            corners = TopDownBBoxCrop._bbox_to_corners(b)
+            warped = TopDownBBoxCrop._apply_homography(corners, H)
+            x1, y1 = warped.min(axis=0)
+            x2, y2 = warped.max(axis=0)
+            warped_boxes.append([x1, y1, x2, y2])
+        return np.asarray(warped_boxes, dtype=np.float32)
+
+    def transform(self, results: dict) -> dict:
+        if 'crop_bbox' not in results or 'img' not in results:
+            return results
+
+        img = results['img']
+        crop_bbox = np.asarray(results['crop_bbox'], dtype=np.float32)
+
+        H_prev = results.get(
+            'homography_matrix', np.eye(3, dtype=np.float32)
+        )
+
+        # --- main crop_bbox crop ---
+        corners = self._bbox_to_corners(crop_bbox)
+        corners = self._apply_homography(corners, H_prev)
+
+        # recompute axis-aligned corners
+        x1, y1 = corners[:, 0].min(), corners[:, 1].min()
+        x2, y2 = corners[:, 0].max(), corners[:, 1].max()
+
+        # --- clip to image shape ---
+        h, w = results['img_shape']
+        x1 = np.clip(x1, 0, w - 1)
+        x2 = np.clip(x2, 0, w - 1)
+        y1 = np.clip(y1, 0, h - 1)
+        y2 = np.clip(y2, 0, h - 1)
+
+        corners = np.array([
+            [x1, y1],
+            [x2, y1],
+            [x2, y2],
+            [x1, y2]
+        ], dtype=np.float32)
+
+
+        crop, H_crop = self._perspective_crop(img, corners)
+
+        # compose homography
+        H_new = H_crop @ H_prev
+        results['homography_matrix'] = H_new
+
+        # --- update gt_bboxes ---
+        if 'gt_bboxes' in results:
+            gt = results['gt_bboxes']
+
+            if hasattr(gt, 'tensor'):  # BaseBoxes
+                b = gt.tensor.cpu().numpy()
+                b = self._warp_and_aabb(b, H_new)
+                b[:, [0, 2]] = np.clip(b[:, [0, 2]], 0, crop.shape[1])
+                b[:, [1, 3]] = np.clip(b[:, [1, 3]], 0, crop.shape[0])
+                gt.tensor = gt.tensor.new_tensor(b)
+
+            else:  # numpy
+                b = self._warp_and_aabb(gt, H_new)
+                b[:, [0, 2]] = np.clip(b[:, [0, 2]], 0, crop.shape[1])
+                b[:, [1, 3]] = np.clip(b[:, [1, 3]], 0, crop.shape[0])
+                results['gt_bboxes'] = b
+
+        # --- optionally update keypoints ---
+        if self.transform_keypoints and 'gt_keypoint_coords' in results:
+            kpts = results['gt_keypoint_coords']
+            # (N,1,2) or (N,2)
+            reshape_1d = False
+            if kpts.ndim == 3:
+                reshape_1d = True
+                kpts = kpts[:, 0, :]
+            kpts = self._apply_homography(kpts, H_new)
+            if reshape_1d:
+                kpts = kpts[:, None, :]
+            results['gt_keypoint_coords'] = kpts
+
+        # --- finalize ---
+        results['img'] = crop
+        results['img_shape'] = (crop.shape[0], crop.shape[1])
+
+        return results
+
+    def __repr__(self):
+        return f"{self.__class__.__name__}(transform_keypoints={self.transform_keypoints})"
+    
+    
+@TRANSFORMS.register_module()
+class PackKeypointGraphInputs(PackDetInputs):
+    def __init__(self,
+                 meta_keys=('img_id', 'img_path', 'ori_shape', 'img_shape',
+                            'scale_factor', 'flip', 'flip_direction'),
+                 pack_only_inliers=True):
+        self.meta_keys = meta_keys
+        self.pack_only_inliers = pack_only_inliers
+    
     mapping_table = {
         'gt_bboxes': 'bboxes',
         'gt_keypoint_labels': 'labels',
@@ -218,103 +370,79 @@ class PackKeypointGraphInputs(PackDetInputs):
     }
     
     def transform(self, results: dict) -> dict:
-        """Method to pack the input data.
-
-        Args:
-            results (dict): Result dict from the data pipeline.
-
-        Returns:
-            dict:
-            - 'inputs' (obj:`torch.Tensor`): The forward data of models.
-            - 'data_sample' (obj:`DetDataSample`): The annotation info of the sample.
         """
+        Pack inputs and optionally ignore keypoints that lie outside the image.
+        
+        Args:
+            results: Dictionary containing image and keypoint data
+            
+        Returns:
+            packed_results: Packed data with optional filtering
+        """
+        if self.pack_only_inliers:
+            valid_mask = self._get_valid_mask(results)
+            if valid_mask is not None:
+                results = self._filter_results(results, valid_mask)
+        
+        # Call base packer
         packed_results = super().transform(results)
         
+        # Attach relation matrices
         if 'gt_relation_matrices' in results:
-            relation_matrices = results['gt_relation_matrices']
-            
-            if 'gt_ignore_flags' in results:
-                valid_idx = np.where(results['gt_ignore_flags'] == 0)[0]
-                
-                # Filter relation matrices in both dimensions (rows and columns)
-                relation_matrices = relation_matrices[valid_idx][:, valid_idx, :]
-            
-            packed_results['data_samples'].gt_instances.relation_matrices = to_tensor(relation_matrices)
+            packed_results['data_samples'] \
+                .gt_instances.relation_matrices = to_tensor(
+                    results['gt_relation_matrices']
+                )
         
         return packed_results
-
-
-@TRANSFORMS.register_module()
-class TopDownBBoxCrop(BaseTransform):
-    """Crop image tightly to bbox (x1,y1,x2,y2). Adjust keypoint coordinates by translation only.
     
-    Also records a 3x3 homography_matrix (pure translation) so later transforms
-    (e.g. TransformKeypoints) can update keypoint coordinates consistently.
-    The new translation homography is left-multiplied onto any existing one.
-    
-    Additionally updates gt_bboxes (if present) by applying the same translation and clamping
-    to the new image size.
-    """
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-
-    def transform(self, results: dict) -> dict:
-        if 'bbox' not in results or 'img' not in results:
-            return results
-        img = results['img']
-        h, w = img.shape[:2]
-        x1, y1, x2, y2 = np.array(results['bbox'], dtype=np.float32)
-        x1c = max(0, int(np.floor(x1)))
-        y1c = max(0, int(np.floor(y1)))
-        x2c = min(w, int(np.ceil(x2)))
-        y2c = min(h, int(np.ceil(y2)))
-        if x2c <= x1c or y2c <= y1c:
-            return results
-
-        crop = img[y1c:y2c, x1c:x2c].copy()
-
-        # Record the homography matrix for this crop (pure translation)
-        offset_w = x1c
-        offset_h = y1c
-        homography_matrix = np.array(
-            [[1, 0, -offset_w],
-             [0, 1, -offset_h],
-             [0, 0, 1]], dtype=np.float32)
-        if results.get('homography_matrix', None) is None:
-            results['homography_matrix'] = homography_matrix
+    def _get_valid_mask(self, results: dict) -> np.ndarray:
+        """Determine valid keypoints (inside image bounds and not ignored)."""
+        img_h, img_w = results['img_shape']
+        keypoints = results.get('gt_keypoint_coords', None)
+        
+        # Check if keypoints are inside image bounds
+        if keypoints is not None:
+            keypoints = np.asarray(keypoints)
+            x = keypoints[:, 0, 0]
+            y = keypoints[:, 0, 1]
+            inside_mask = (
+                (x >= 0) & (x < img_w) &
+                (y >= 0) & (y < img_h)
+            )
         else:
-            results['homography_matrix'] = homography_matrix @ results['homography_matrix']
-
-        if 'gt_bboxes' in results:
-            gt_bboxes = results['gt_bboxes']
-            new_w = crop.shape[1]
-            new_h = crop.shape[0]
-            if hasattr(gt_bboxes, 'tensor'):  # BaseBoxes instance
-                b = gt_bboxes.tensor.clone()
-                # subtract translation
-                b[:, 0] -= offset_w  # x1
-                b[:, 2] -= offset_w  # x2
-                b[:, 1] -= offset_h  # y1
-                b[:, 3] -= offset_h  # y2
-                # clamp
-                b[:, 0].clamp_(0, new_w)
-                b[:, 2].clamp_(0, new_w)
-                b[:, 1].clamp_(0, new_h)
-                b[:, 3].clamp_(0, new_h)
-                gt_bboxes.tensor = b
-            else:  # numpy array
-                b = gt_bboxes
-                b[:, [0, 2]] -= offset_w
-                b[:, [1, 3]] -= offset_h
-                b[:, [0, 2]] = np.clip(b[:, [0, 2]], 0, new_w)
-                b[:, [1, 3]] = np.clip(b[:, [1, 3]], 0, new_h)
-                results['gt_bboxes'] = b
-
-        results['img'] = crop
-        results['bbox'] = np.array([0, 0, crop.shape[1], crop.shape[0]], dtype=np.float32)
-        results['img_shape'] = (crop.shape[0], crop.shape[1])
+            inside_mask = None
+        
+        # Combine with gt_ignore_flags if present
+        if 'gt_ignore_flags' in results:
+            ignore_mask = results['gt_ignore_flags'] == 0
+            valid_mask = ignore_mask if inside_mask is None \
+                else (ignore_mask & inside_mask)
+        else:
+            valid_mask = inside_mask
+        
+        return valid_mask
+    
+    def _filter_results(self, results: dict, valid_mask: np.ndarray) -> dict:
+        """Filter results based on valid_mask."""
+        valid_idx = np.where(valid_mask)[0]
+        
+        # Filter mapping table keys
+        for key in self.mapping_table.keys():
+            if key not in results:
+                continue
+            results[key] = results[key][valid_idx]
+        
+        # Filter relation matrices on both axes
+        if 'gt_relation_matrices' in results:
+            rel = results['gt_relation_matrices']
+            rel = rel[valid_idx][:, valid_idx, :]
+            results['gt_relation_matrices'] = rel
+        
+        # Update ignore flags to reflect filtering
+        results['gt_ignore_flags'] = np.zeros(
+            len(valid_idx), dtype=np.int64
+        )
+        
         return results
 
-    def __repr__(self):
-        return f"{self.__class__.__name__}()"

@@ -76,7 +76,7 @@ class ContrastiveEmbed(nn.Module):
             res = res / math.sqrt(visual_feat.shape[-1])
         if self.bias is not None:
             res = res + self.bias
-        res.masked_fill_(~text_token_mask[:, None, :], float('-inf'))
+        res = res.masked_fill(~text_token_mask[:, None, :], float('-inf'))
 
         return res
 
@@ -139,7 +139,7 @@ class RelationBranch(nn.Module):
         
         return relation_features, (row_indices, col_indices)
 
-    def forward_single(self, 
+    def forward_single_train(self, 
                         hidden_states: Tensor,
                         memory_item: Tensor,
                         memory_mask_item: Tensor,
@@ -148,8 +148,7 @@ class RelationBranch(nn.Module):
                         spatial_shapes: Tensor,
                         level_start_index: Tensor,
                         memory_relation_text_item: Tensor,
-                        relation_text_token_mask_item: Tensor,
-                        return_intermediate: bool = False) -> Tensor:
+                        relation_text_token_mask_item: Tensor) -> Tensor:
         """Process a single batch item to generate relation predictions.
 
         Args:
@@ -162,7 +161,6 @@ class RelationBranch(nn.Module):
             level_start_index (Tensor): Level start index of shape (num_valid,).
             memory_relation_text_item (Tensor): Memory relation text item of shape (1, num_memory_text, embed_dims).
             relation_text_token_mask_item (Tensor): Relation text token mask item of shape (1, num_memory_text).
-            return_intermediate (bool): Whether to return scores for each decoder layer.
 
         Returns:
             Tensor: Relation scores matrix for valid nodes,
@@ -193,46 +191,30 @@ class RelationBranch(nn.Module):
             self_attn_mask=None
         )
         
-        if return_intermediate:
-            num_layers = refined_relation_features.shape[0]
-            refined_relation_features = refined_relation_features.reshape(num_layers, num_pairs, -1)
-            
-            relation_scores = torch.zeros(
-                (num_layers, n_valid, n_valid, memory_relation_text_item.shape[0]),
-                dtype=torch.float32, device=hidden_states.device
-            )
-            
-            for layer_idx in range(num_layers):
-                layer_features = refined_relation_features[layer_idx]
-                layer_scores = self.relation_classifier(
-                    layer_features,
-                    memory_relation_text_item.unsqueeze(0),
-                    relation_text_token_mask_item.unsqueeze(0)
-                )
-                
-                # Fill upper triangular part
-                relation_scores[layer_idx, row_indices, col_indices] = layer_scores
-                # Fill lower triangular part (symmetric matrix)
-                relation_scores[layer_idx, col_indices, row_indices] = layer_scores
-        else:
-            refined_relation_features = refined_relation_features[-1]
-
-            relation_scores = torch.zeros(
-                (n_valid, n_valid, memory_relation_text_item.shape[0]),
-                dtype=torch.float32, device=hidden_states.device
-            )
-            scores = self.relation_classifier(
-                refined_relation_features.reshape(num_pairs, -1),
+        num_layers = refined_relation_features.shape[0]
+        refined_relation_features = refined_relation_features.reshape(num_layers, num_pairs, -1)
+        
+        relation_scores = torch.zeros(
+            (num_layers, n_valid, n_valid, memory_relation_text_item.shape[0]),
+            dtype=torch.float32, device=hidden_states.device
+        )
+        
+        for layer_idx in range(num_layers):
+            layer_features = refined_relation_features[layer_idx]
+            layer_scores = self.relation_classifier(
+                layer_features,
                 memory_relation_text_item.unsqueeze(0),
                 relation_text_token_mask_item.unsqueeze(0)
             )
             
             # Fill upper triangular part
-            relation_scores[row_indices, col_indices] = scores
+            relation_scores[layer_idx, row_indices, col_indices] = layer_scores
             # Fill lower triangular part (symmetric matrix)
-            relation_scores[col_indices, row_indices] = scores
+            relation_scores[layer_idx, col_indices, row_indices] = layer_scores
 
         return relation_scores
+
+    
 
     def forward(self, 
                 hidden_states: Tensor,
@@ -244,35 +226,26 @@ class RelationBranch(nn.Module):
                 references: Tensor,
                 memory_relation_text: Tensor,
                 relation_text_token_mask: Tensor,
-                mask: Optional[Tensor] = None,
-                return_intermediate: bool = False) -> Tensor:
+                mask: Optional[Tensor] = None) -> Tensor:
         """
         
         Args:
             hidden_states: Hidden states with shape (batch_size, num_queries, embed_dims)
             ...
             mask: Boolean mask with shape (batch_size, num_queries)
-            return_intermediate: (bool) Whether to return scores for each decoder layer.
 
         Returns:
-            Tensor: Relation predictions with shape (batch_size, num_queries, num_queries, len_text)
-                if return_intermediate is False otherwise (batch_size, num_decoder_layers, num_queries, num_queries, len_text)
+            Tensor: Relation predictions with shape (batch_size, num_decoder_layers, num_queries, num_queries, len_text)
         """
         batch_size, num_queries, embed_dims = hidden_states.shape
 
         memory = self.memory_proj(memory)
         memory_relation_text = self.memory_relation_proj(memory_relation_text)
         
-        if return_intermediate:
-            batch_relations = torch.zeros(
-                (batch_size, self.decoder.num_layers if self.decoder is not None else 1, num_queries, num_queries, memory_relation_text.shape[1]),
-                device=hidden_states.device
-            )
-        else:
-            batch_relations = torch.zeros(
-                (batch_size, num_queries, num_queries, memory_relation_text.shape[1]),
-                device=hidden_states.device
-            )
+        batch_relations = torch.zeros(
+            (batch_size, self.decoder.num_layers if self.decoder is not None else 1, num_queries, num_queries, memory_relation_text.shape[1]),
+            device=hidden_states.device
+        )
         
         for b_idx in range(0, batch_size):
             valid_indices = torch.where(mask[b_idx])[0] if mask is not None else torch.arange(num_queries, device=hidden_states.device)
@@ -280,7 +253,7 @@ class RelationBranch(nn.Module):
             if len(valid_indices) <= 1:  # Skip if 0 or 1 valid nodes (no pairs)
                 continue
             
-            relations = self.forward_single(
+            relations = self.forward_single_train(
                 hidden_states=hidden_states[b_idx, valid_indices],
                 memory_item=memory[b_idx],
                 memory_mask_item=memory_mask[b_idx] if memory_mask is not None else None,
@@ -290,15 +263,102 @@ class RelationBranch(nn.Module):
                 level_start_index=level_start_index,
                 memory_relation_text_item=memory_relation_text[b_idx],
                 relation_text_token_mask_item=relation_text_token_mask[b_idx],
-                return_intermediate=return_intermediate
             )
             
-            if return_intermediate:
-                batch_relations[b_idx, :, valid_indices[:, None], valid_indices] = relations
-            else:
-                batch_relations[b_idx, valid_indices[:, None], valid_indices] = relations
+            batch_relations[b_idx, :, valid_indices[:, None], valid_indices] = relations
 
         return batch_relations
+
+    def predict(
+        self,
+        hidden_states: Tensor,
+        memory: Tensor,
+        memory_mask: Tensor,
+        spatial_shapes: Tensor,
+        level_start_index: Tensor,
+        valid_ratios: Tensor,
+        references: Tensor,
+        memory_relation_text: Tensor,
+        relation_text_token_mask: Tensor,
+        batch_data_samples: SampleList
+    ):
+
+        B, N, D = hidden_states.shape
+
+        memory = self.memory_proj(memory)
+        memory_relation_text = self.memory_relation_proj(memory_relation_text)
+
+        # ---- build pair indices once ----
+        idx = torch.arange(N, device=hidden_states.device)
+        row = idx.unsqueeze(1).expand(N, N)
+        col = idx.unsqueeze(0).expand(N, N)
+        mask = row < col
+        row_idx = row[mask]
+        col_idx = col[mask]
+
+        # ---- gather node features ----
+        q1 = hidden_states[:, row_idx]      # (B, num_pairs, D)
+        q2 = hidden_states[:, col_idx]      # (B, num_pairs, D)
+
+        pair_features = torch.cat([q1, q2], dim=-1)
+        relation_features = self.node_pair_to_relation_feat(pair_features)  # (B, num_pairs, D)
+
+        # ---- reference points ----
+        src_refs = references[:, row_idx, :2]
+        dst_refs = references[:, col_idx, :2]
+        relation_reference_points = (src_refs + dst_refs) / 2  # (B, num_pairs, 2)
+
+        # ---- decoder ----
+        refined_relation_features, _ = self.decoder(
+            query=relation_features,
+            value=memory,
+            reference_points=relation_reference_points,
+            valid_ratios=valid_ratios,
+            key_padding_mask=memory_mask,
+            spatial_shapes=spatial_shapes,
+            level_start_index=level_start_index,
+            memory_text=memory_relation_text,
+            text_attention_mask=~relation_text_token_mask,
+            reg_branches=None,
+            self_attn_mask=None
+        )
+
+        refined_relation_features = refined_relation_features[-1]  # (B, num_pairs, D)
+
+        # ---- classification ----
+        scores = self.relation_classifier(
+            refined_relation_features,
+            memory_relation_text,
+            relation_text_token_mask
+        )  # (B, num_pairs, num_text)
+
+        # ---- scatter to full matrix ----
+        relation_scores = torch.zeros(
+            B, N, N, scores.shape[-1],
+            device=hidden_states.device
+        )
+
+        relation_scores[:, row_idx, col_idx] = scores
+        relation_scores[:, col_idx, row_idx] = scores
+
+        # ---- convert grounding logits ----
+        relation_predictions = []
+
+        for i in range(B):
+            rel = relation_scores[i]
+
+            rel = rel.reshape(N * N, -1)
+
+            rel = convert_grounding_to_cls_scores(
+                logits=rel.sigmoid()[None],
+                positive_maps=[batch_data_samples[i].token_positive_map_relation]
+            )[0]
+
+            rel = rel.reshape(N, N, -1)
+
+            relation_predictions.append(rel)
+
+        return relation_predictions
 
 
 @MODELS.register_module()
@@ -334,6 +394,34 @@ class GroundingPOSEHead(GroundingDINOHead):
                 level_start_index: Tensor,
                 valid_ratios: Tensor,
                 rescale: bool = True) -> InstanceList:
+        predictions, relation_predictions = self.predict_onnx(hidden_states, references, memory_text, text_token_mask, memory_relation_text, relation_text_token_mask, batch_data_samples, memory, memory_mask, spatial_shapes, level_start_index, valid_ratios, rescale)
+        
+        results = []
+        for (scores, labels, keypoints, _), relation_scores in zip(predictions, relation_predictions):
+            instance = InstanceData()
+            instance.scores = scores
+            instance.labels = labels
+            instance.keypoints = keypoints
+            instance.relation_scores = relation_scores
+            results.append(instance)
+   
+        return results
+
+    def predict_onnx(self,
+                hidden_states: Tensor,
+                references: List[Tensor],
+                memory_text: Tensor,
+                text_token_mask: Tensor,
+                memory_relation_text: Tensor,
+                relation_text_token_mask: Tensor,
+                batch_data_samples: SampleList,
+                memory: Tensor,
+                memory_mask: Tensor,
+                spatial_shapes: Tensor,
+                level_start_index: Tensor,
+                valid_ratios: Tensor,
+                rescale: bool = True) -> InstanceList:
+        
         predictions = super().predict(
             hidden_states=hidden_states,
             references=references,
@@ -343,18 +431,13 @@ class GroundingPOSEHead(GroundingDINOHead):
             rescale=rescale)
 
         hidden_states_indexed = torch.stack([
-            hidden_states[-1, i, pred.indexes] for i, pred in enumerate(predictions)
+            hidden_states[-1, i, indexes] for i, (_, _, _, indexes) in enumerate(predictions)
         ])
         references_indexed = torch.stack([
-            references[-1][i, pred.indexes] for i, pred in enumerate(predictions)
+            references[-1][i, indexes] for i, (_, _, _, indexes) in enumerate(predictions)
         ])
 
-        min_score_for_relation = self.test_cfg.get('min_score_for_relation', 0.0)
-        mask = torch.stack([
-            pred.scores > min_score_for_relation for pred in predictions
-        ])
-
-        relation_prediction_batch = self.relation_branch(
+        relation_predictions = self.relation_branch.predict(
             hidden_states_indexed,
             memory=memory,
             memory_mask=memory_mask,
@@ -364,19 +447,10 @@ class GroundingPOSEHead(GroundingDINOHead):
             references=references_indexed,
             memory_relation_text=memory_relation_text,
             relation_text_token_mask=relation_text_token_mask,
-            mask=mask
+            batch_data_samples=batch_data_samples
         )
 
-        for data_sample, pred, relation_scores in zip(batch_data_samples, predictions, relation_prediction_batch):
-            num_queries, _, _ = relation_scores.shape
-
-            relation_scores = relation_scores.reshape(num_queries * num_queries, -1)
-            relation_scores = convert_grounding_to_cls_scores(
-                logits=relation_scores.sigmoid()[None],
-                positive_maps=[data_sample.token_positive_map_relation])[0]
-            pred.relation_scores = relation_scores.reshape(num_queries, num_queries, -1)
-
-        return predictions
+        return predictions, relation_predictions
     
     def _predict_by_feat_single(self,
                                 cls_score: Tensor,
@@ -399,18 +473,14 @@ class GroundingPOSEHead(GroundingDINOHead):
                 space. Default True.
 
         Returns:
-            :obj:`InstanceData`: Detection results of each image
-            after the post process.
-            Each item usually contains following keys.
-
-                - scores (Tensor): Classification scores, has a shape
-                  (num_instance, )
-                - labels (Tensor): Labels of bboxes, has a shape
-                  (num_instances, ).
-                - keypoints (Tensor): The center of the bbox, has a shape
-                    (num_instances, 2), the last dimension 2 arrange as (cx, cy).
-                - indexes (Tensor): The index of the bbox in the original
-                    `bbox_pred` tensor, has a shape (num_instances, ).
+            - scores (Tensor): Classification scores, has a shape
+                (num_instance, )
+            - labels (Tensor): Labels of bboxes, has a shape
+                (num_instances, ).
+            - keypoints (Tensor): The center of the bbox, has a shape
+                (num_instances, 2), the last dimension 2 arrange as (cx, cy).
+            - indexes (Tensor): The index of the bbox in the original
+                `bbox_pred` tensor, has a shape (num_instances, ).
         """
         assert len(cls_score) == len(bbox_pred)  # num_queries
         max_per_img = self.test_cfg.get('max_per_img', len(cls_score))
@@ -434,13 +504,8 @@ class GroundingPOSEHead(GroundingDINOHead):
         if rescale:
             assert img_meta.get('scale_factor') is not None
             det_keypoints /= det_keypoints.new_tensor(img_meta['scale_factor'])[:2].unsqueeze(0)
-
-        results = InstanceData()
-        results.scores = scores
-        results.labels = det_labels
-        results.keypoints = det_keypoints
-        results.indexes = bbox_index
-        return results
+        
+        return scores, det_labels, det_keypoints, bbox_index
 
     def loss(self, 
          hidden_states: Tensor,
@@ -511,7 +576,7 @@ class GroundingPOSEHead(GroundingDINOHead):
         relation_mask = relation_weights > 0
         relation_mask = torch.any(relation_mask, dim=2) | torch.any(relation_mask, dim=1)
 
-        relation_preds = self.relation_branch(
+        relation_preds = self.relation_branch.forward(
             hidden_states=hidden_states,
             memory=memory,
             memory_mask=memory_mask,
@@ -522,7 +587,6 @@ class GroundingPOSEHead(GroundingDINOHead):
             memory_relation_text=memory_relation_text,
             relation_text_token_mask=relation_text_token_mask,
             mask=relation_mask,
-            return_intermediate=True
         ) # (batch_size, num_decoder_layer, num_queries, num_queries, len_text)
 
         # Loss is not computed for the padded regions of the text.

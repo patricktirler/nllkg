@@ -64,7 +64,8 @@ def split_coco_dataset(images: List[Dict[str, Any]], train_size: float, val_size
 def update_image_paths(images: List[Dict[str, Any]], split_name: str) -> None:
     """Update the file paths of images to point to the correct split directory."""
     for image in images:
-        image['path'] = os.path.join("images", split_name, os.path.basename(image['path']))
+        if 'path' in image:
+            image['path'] = os.path.join("images", split_name, os.path.basename(image['path']))
 
 def compute_statistics(images, annotations, categories):
     stats = {}

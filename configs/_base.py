@@ -1,6 +1,6 @@
 _base_ = 'mmdet::grounding_dino/grounding_dino_swin-t_finetune_16xb2_1x_coco.py'
 
-custom_imports = dict(imports=['models', 'datasets', 'tools'])
+custom_imports = dict(imports=['nllkg'])
 
 dataset_type = 'KeypointGraphDataset'
 
@@ -123,7 +123,7 @@ test_evaluator = dict(
 max_epoch = 200
 
 default_hooks = dict(
-    checkpoint=dict(interval=1, max_keep_ckpts=2, save_best='auto', rule='greater'),
+    checkpoint=dict(interval=1, max_keep_ckpts=2, save_best='nllkg/summary/overall_score', rule='greater'),
     logger=dict(type='LoggerHook', interval=200))
 
 train_cfg = dict(

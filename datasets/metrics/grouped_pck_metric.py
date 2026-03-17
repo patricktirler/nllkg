@@ -5,13 +5,14 @@ from collections import Counter
 
 from mmpose.evaluation.metrics.keypoint_2d_metrics import PCKAccuracy
 from mmdet.registry import METRICS
-from tools.graph_grouping import (
-    group_keypoints_into_instances,
-    make_merge_fn_max_label,
-)
-from tools.graph_matching import sequential_matching
 from mmengine.logging import MMLogger
 from mmpose.evaluation.functional import keypoint_pck_accuracy
+
+from ...tools.graph_grouping import (
+    group_keypoints_into_instances,
+    make_is_valid_max_label,
+)
+from ...tools.graph_matching import sequential_matching
 
 
 @METRICS.register_module()
@@ -105,12 +106,11 @@ class GroupedPCKAccuracy(PCKAccuracy):
             f_rel = rel_full[np.ix_(valid_idx, valid_idx, np.arange(rel_full.shape[2]))]
 
             # Group nodes into instances with per-label maxima
-            merge_fn = make_merge_fn_max_label(per_label_max_ids, relation_scores=f_rel)
             instance_groups = group_keypoints_into_instances(
                 keypoint_labels=f_labels,
                 keypoint_scores=f_scores,
                 relation_scores=f_rel,
-                merge_fn=merge_fn,
+                is_valid=make_is_valid_max_label(per_label_max_ids),
                 min_edge_score=self.edge_score_thresh,
             )
 

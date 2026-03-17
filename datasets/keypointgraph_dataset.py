@@ -3,10 +3,60 @@ from typing import List, Union
 import numpy as np
 import os
 import json
-
+import copy
 
 from mmdet.registry import DATASETS
 from mmdet.datasets import CocoDataset
+
+def generate_crop_coordinates(img_height, img_width, crop_height, crop_width, min_overlap=0):
+    """Generate evenly spaced crop coordinates with minimum overlap.
+    
+    Args:
+        img_height (int): Image height
+        img_width (int): Image width
+        crop_height (int): Crop height
+        crop_width (int): Crop width
+        min_overlap (float): Minimum overlap between crops (0-1). Defaults to 0.
+        
+    Returns:
+        List[tuple]: List of (x1, y1, x2, y2) crop coordinates
+    """
+    crops = []
+    
+    # Calculate stride based on min_overlap
+    stride_h = int(crop_height * (1 - min_overlap))
+    stride_w = int(crop_width * (1 - min_overlap))
+    
+    # Ensure stride is at least 1
+    stride_h = max(1, stride_h)
+    stride_w = max(1, stride_w)
+    
+    # Calculate number of crops needed to cover the image
+    num_crops_h = max(1, int(np.ceil((img_height - crop_height) / stride_h)) + 1)
+    num_crops_w = max(1, int(np.ceil((img_width - crop_width) / stride_w)) + 1)
+    
+    # Generate evenly spaced positions
+    if num_crops_h == 1:
+        y_positions = [0]
+    else:
+        y_positions = [int(i * (img_height - crop_height) / (num_crops_h - 1)) 
+                       for i in range(num_crops_h)]
+    
+    if num_crops_w == 1:
+        x_positions = [0]
+    else:
+        x_positions = [int(i * (img_width - crop_width) / (num_crops_w - 1)) 
+                       for i in range(num_crops_w)]
+    
+    # Generate all crop coordinates
+    for y in y_positions:
+        for x in x_positions:
+            x1, y1 = x, y
+            x2, y2 = x + crop_width, y + crop_height
+            crops.append((x1, y1, x2, y2))
+    
+    return crops
+
 
 
 @DATASETS.register_module()
@@ -60,11 +110,15 @@ class KeypointGraphDataset(CocoDataset):
     Args:
         data_root (str): Root path of dataset
         ann_file (str): Annotation file path
+        crop_sizes (List[tuple], optional): List of (height, width) tuples for crop sizes. If given, generates evenly spaced crops. Defaults to None.
+        min_crop_overlap (float, optional): Minimum overlap between crops (0-1). Defaults to 0.
     """
 
     METAINFO = {}
 
-    def __init__(self, data_root, ann_file, **kwargs):
+    def __init__(self, data_root, ann_file, crop_sizes=None, min_crop_overlap=0, **kwargs):
+        self.crop_sizes = crop_sizes
+        self.min_crop_overlap = min_crop_overlap
         metainfo = self.load_metainfo(data_root, ann_file)
         super().__init__(data_root=data_root, ann_file=ann_file, metainfo=metainfo, **kwargs)
 
@@ -90,6 +144,59 @@ class KeypointGraphDataset(CocoDataset):
         metainfo['relation_names'] = tuple(sorted(unique_relation_names))
 
         return metainfo
+
+    def load_data_list(self) -> List[dict]:
+        """Load annotations from an annotation file named as ``self.ann_file``
+        Returns:
+            List[dict]: A list of annotation.
+        """
+        base_data_list = super().load_data_list()
+        
+        if self.crop_sizes is None:
+            return base_data_list
+        
+        # Apply cropping to each item in the base data list
+        cropped_data_by_size = {crop_size: [] for crop_size in self.crop_sizes}
+        
+        for parsed_data_info in base_data_list:
+            img_height = parsed_data_info['height']
+            img_width = parsed_data_info['width']
+            instances = parsed_data_info.get('instances', [])
+            
+            for crop_h_org, crop_w_org in self.crop_sizes:
+                crop_h = min(crop_h_org, img_height)
+                crop_w = min(crop_w_org, img_width)
+
+                # Generate crop coordinates
+                crop_coords = generate_crop_coordinates(
+                    img_height, img_width, crop_h, crop_w, self.min_crop_overlap
+                )
+                
+                # Create a copy of data_info for each crop, but only if it contains keypoints
+                for crop_bbox in crop_coords:
+                    x1, y1, x2, y2 = crop_bbox
+                    
+                    # Check if any keypoint is within this crop bbox
+                    has_keypoints = False
+                    for instance in instances:
+                        kp_x, kp_y = instance['keypoint_coords']
+                        if x1 <= kp_x < x2 and y1 <= kp_y < y2:
+                            has_keypoints = True
+                            break
+                    
+                    # Only add crop if it contains keypoints
+                    if has_keypoints:
+                        cropped_data = copy.deepcopy(parsed_data_info)
+                        cropped_data['crop_bbox'] = crop_bbox  # (x1, y1, x2, y2)
+                        cropped_data_by_size[(crop_h_org, crop_w_org)].append(cropped_data)
+        
+        # Concatenate all cropped data
+        cropped_data_list = []
+        for crop_size in self.crop_sizes:
+            items = cropped_data_by_size[crop_size]
+            cropped_data_list.extend(items)
+        
+        return cropped_data_list
 
     def parse_data_info(self, raw_data_info: dict) -> Union[dict, List[dict]]:
         """Parse raw annotation to target format.

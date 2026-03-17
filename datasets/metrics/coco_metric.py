@@ -4,9 +4,9 @@ from typing import Dict, List, Sequence, Any, Optional
 from mmpose.evaluation.metrics.coco_metric import CocoMetric
 from mmdet.registry import METRICS
 
-from tools.graph_grouping import (
+from ...tools.graph_grouping import (
     group_keypoints_into_instances,
-    make_merge_fn_max_label,
+    make_is_valid_max_label,
 )
 
 
@@ -149,14 +149,12 @@ class PoseCocoMetric(CocoMetric):
                 # Slice relation scores (preserve last dim R)
                 R = relation_scores.shape[2]
                 f_rel = relation_scores[np.ix_(valid_idx, valid_idx, np.arange(R))]
-                # Build merge function (max_per_label = 1)
-                merge_fn = make_merge_fn_max_label(1, relation_scores=f_rel)
                 # Group
                 instance_groups = group_keypoints_into_instances(
                     keypoint_labels=f_labels,
                     keypoint_scores=f_scores,
                     relation_scores=f_rel,
-                    merge_fn=merge_fn,
+                    is_valid=make_is_valid_max_label(1),
                     min_edge_score=self.edge_score_thresh
                 )
                 # Convert groups to COCO-format persons
